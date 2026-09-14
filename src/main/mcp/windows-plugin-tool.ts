@@ -30,24 +30,26 @@ function callableTools() {
 /**
  * One bounded Core entry point for the remote Windows Desktop Commander plugin.
  *
- * The external MCP server still owns the actual schemas, validation and execution. Core
- * intentionally exposes only this wrapper so a user can keep one ChatGPT connector while
- * avoiding 30+ Desktop Commander schemas in every Core discovery response.
+ * The wrapper is deliberately registered on every Core server, even when the plugin is
+ * absent or still connecting. ChatGPT caches connector schemas per conversation; making
+ * this declaration appear/disappear with plugin startup state creates stale conversations
+ * where Windows works once and then vanishes. Runtime admission below remains authoritative:
+ * an absent, disabled or reconnecting plugin returns a useful error without changing the
+ * Core schema.
+ *
+ * The external MCP server still owns the actual action schemas, validation and execution.
+ * Core exposes only this wrapper so the user keeps one ChatGPT connector without paying for
+ * 30+ Desktop Commander schemas in every discovery response.
  */
 export function registerWindowsPluginTool(reg: SurfaceRegistrar): void {
-  // Keep stock Core unchanged when the integration is not installed. Plugin records are
-  // restored before the MCP endpoint is started, so an installed integration is visible
-  // here even while its background connection is still becoming Ready. Installing this
-  // plugin later requires the same Core refresh/reconnect that any tool-list change needs.
-  if (!windowsPlugin()) return;
-
   reg.register(
     'windows',
     toolDeclaration('windows', () => ({
       title: 'Remote Windows host',
       description:
-        'Call the installed "Windows Desktop Commander" plugin to work on the remote Windows PC. ' +
-        'Use action="list_tools" first when you need the exact Desktop Commander action names. ' +
+        'Use this Core tool for the remote Windows PC through the installed "Windows Desktop Commander" plugin. ' +
+        'Do not look for or require a separate Remote Desktop Commander connector. ' +
+        'Use action="list_tools" when you need the exact Desktop Commander action names. ' +
         'For any other action, pass that tool name plus its arguments object unchanged. ' +
         'This targets the remote Windows machine, not the local Mac running Chat On Steroids.',
       inputSchema: z
@@ -79,7 +81,7 @@ export function registerWindowsPluginTool(reg: SurfaceRegistrar): void {
         const { plugin, tools } = callableTools();
         if (!plugin) {
           return fail(
-            `WINDOWS_PLUGIN_MISSING: install and enable a CoS plugin named "${WINDOWS_PLUGIN_NAME}" in Settings → Plugins, then refresh Core.`
+            `WINDOWS_PLUGIN_MISSING: install and enable a CoS plugin named "${WINDOWS_PLUGIN_NAME}" in Settings → Plugins. The Core windows tool itself is already connected.`
           );
         }
         if (!plugin.enabled || plugin.status !== 'ready') {
