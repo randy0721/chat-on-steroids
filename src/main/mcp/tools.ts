@@ -20,6 +20,7 @@ import { createRegistrar, type ToolContext } from './kernel.js';
 import { registerCoreTools } from './tools-core.js';
 import { registerDesktopTools } from './tools-desktop.js';
 import { registerPluginTools } from './tools-plugins.js';
+import { registerWindowsPluginTool } from './windows-plugin-tool.js';
 import { registerCodeMode } from './code-mode-tool.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
 import { serverInstructions } from './instructions.js';
@@ -46,14 +47,18 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId, observe?: (con
     const schema = toolSchemaJson(config.inputSchema);
     tools.push({ name, description: config.description, inputSchema: { type: 'object', ...schema }, ...(config.annotations ? { annotations: { ...config.annotations } } : {}) });
   } : undefined);
-  if (surface === 'core') registerCoreTools(registrar);
-  else registerDesktopTools(registrar);
+  if (surface === 'core') {
+    registerCoreTools(registrar);
+    registerWindowsPluginTool(registrar);
+  } else registerDesktopTools(registrar);
   registerCodeMode(registrar, (name, args, parent) => {
     // Reuse the same registration/validation/handler authority, refreshed for every child
     // so a permission or approved-root change during an awaited script takes effect.
     const nested = createRegistrar(null, liveContext(), surface);
-    if (surface === 'core') registerCoreTools(nested);
-    else registerDesktopTools(nested);
+    if (surface === 'core') {
+      registerCoreTools(nested);
+      registerWindowsPluginTool(nested);
+    } else registerDesktopTools(nested);
     return nested.invokeNested(name, args, parent);
   }, { windowsDesktop: surface === 'desktop' && process.platform === 'win32' });
 
