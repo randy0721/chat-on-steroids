@@ -105,10 +105,10 @@ const CORE: SurfaceDefinition = {
     'Use for: opening and reading files, searching a repository, applying patches, creating, renaming and deleting files, ' +
     'running builds, tests, linters, git, npm and shell commands, continuing long-running or interactive terminal sessions, ' +
     'and saving images and files ChatGPT generates onto this computer. ' +
-    'When a Windows Desktop Commander plugin is installed in CoS, the windows tool also reads files, lists folders and runs commands on that remote Windows PC through the same Core connector. ' +
+    'Core always exposes a windows tool for the remote Windows PC; when the Windows Desktop Commander plugin is ready, use that tool for Windows files, folders and commands through this same Core connector. Do not look for a separate Remote Desktop Commander connector. ' +
     'Also searches and reads local recordings of previous or concurrently running ChatGPT work, and — when the user has ' +
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
-  cardSummary: 'Files, patches, the terminal, and an optional remote Windows bridge. Required — this is the coding connector.',
+  cardSummary: 'Files, patches, the terminal, and a stable remote Windows entry point. Required — this is the coding connector.',
   required: true,
   tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'windows', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
 };
