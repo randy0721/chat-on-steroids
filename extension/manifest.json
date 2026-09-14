@@ -30,6 +30,7 @@
       ],
       "js": [
         "chatgpt-dom.js",
+        "cos-context-guard.js",
         "content.js"
       ],
       "css": [
