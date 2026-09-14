@@ -29,10 +29,16 @@ function callableTools() {
  * avoiding 30+ Desktop Commander schemas in every Core discovery response.
  */
 export function registerWindowsPluginTool(reg: SurfaceRegistrar): void {
+  // Keep stock Core unchanged when the integration is not installed. Plugin records are
+  // restored before the MCP endpoint is started, so an installed integration is visible
+  // here even while its background connection is still becoming Ready. Installing this
+  // plugin later requires the same Core refresh/reconnect that any tool-list change needs.
+  if (!windowsPlugin()) return;
+
   reg.register(
     'windows',
     toolDeclaration('windows', () => ({
-      title: 'Remote Windows computer',
+      title: 'Remote Windows host',
       description:
         'Call the installed "Windows Desktop Commander" plugin to work on the remote Windows PC. ' +
         'Use action="list_tools" first when you need the exact Desktop Commander action names. ' +
@@ -67,7 +73,7 @@ export function registerWindowsPluginTool(reg: SurfaceRegistrar): void {
         const { plugin, tools } = callableTools();
         if (!plugin) {
           return fail(
-            `WINDOWS_PLUGIN_MISSING: install and enable a CoS plugin named "${WINDOWS_PLUGIN_NAME}" in Settings → Plugins.`
+            `WINDOWS_PLUGIN_MISSING: install and enable a CoS plugin named "${WINDOWS_PLUGIN_NAME}" in Settings → Plugins, then refresh Core.`
           );
         }
         if (!plugin.enabled || plugin.status !== 'ready') {
