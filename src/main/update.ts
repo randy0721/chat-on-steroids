@@ -55,6 +55,14 @@ const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest
 const CHECK_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 /**
+ * Custom fork policy: do not contact or auto-install the upstream release channel on startup.
+ * This fork carries local Core integrations that an official update would overwrite. Keeping
+ * the explicit checkForUpdates() implementation intact preserves the updater's tests and leaves
+ * a deliberate/manual check possible for maintainers, while normal app startup stays pinned to
+ * the build the user installed.
+ */
+const AUTOMATIC_UPDATE_CHECKS = false;
+/**
  * How often the check repeats while the app is open.
  *
  * This app lives in the tray and is routinely left running for days, so "once per start" was in
@@ -127,12 +135,17 @@ function set(next: Partial<UpdateStatus>): void {
 }
 
 /**
- * Runs the check at startup, and keeps running it for as long as the app is open.
+ * Runs the automatic update scheduler for official builds.
  *
- * The timer is unreferenced: it is a background courtesy, never a reason for the process to stay
- * alive, and the shutdown sequence does not have to know it exists.
+ * This custom fork deliberately leaves that scheduler off so startup never contacts the
+ * upstream release endpoint and an official package cannot replace the custom Windows bridge.
+ * The explicit checkForUpdates() function remains available for deliberate maintainer use.
  */
 export function startUpdateChecks(): void {
+  if (!AUTOMATIC_UPDATE_CHECKS) {
+    logInfo('update: automatic checks disabled for custom build');
+    return;
+  }
   void checkForUpdates();
   setInterval(() => void checkForUpdates(), RECHECK_MS).unref();
 }
