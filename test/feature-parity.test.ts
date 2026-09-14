@@ -65,6 +65,8 @@ describe('portable browser-backed feature parity', () => {
       'exec_command',
       'write_stdin',
       'download_artifact',
+      // Optional at runtime: registered only when the Windows Desktop Commander plugin exists.
+      'windows',
       'session',
       'update_plan',
       'agents',
