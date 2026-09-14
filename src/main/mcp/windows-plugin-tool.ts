@@ -1,13 +1,19 @@
 import { z } from 'zod';
 import { pluginManager } from '../plugins/manager.js';
 import { getConfig } from '../config.js';
+import type { PluginSnapshot } from '../../shared/plugins.js';
 import { toolDeclaration } from './tool-declarations.js';
 import { fail, guard, ok, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 
 const WINDOWS_PLUGIN_NAME = 'Windows Desktop Commander';
 
 function windowsPlugin() {
-  return pluginManager.snapshot().plugins.find(
+  // Some isolated MCP tests intentionally replace the plugin manager with only the
+  // publication/call methods that their surface exercises. Treat a manager without a
+  // snapshot as "Windows integration not installed" rather than letting Core discovery
+  // fail. Production PluginManager always supplies snapshot().
+  const snapshot = (pluginManager as unknown as { snapshot?: () => PluginSnapshot }).snapshot?.();
+  return snapshot?.plugins.find(
     (plugin) => plugin.name.trim().toLowerCase() === WINDOWS_PLUGIN_NAME.toLowerCase()
   );
 }
