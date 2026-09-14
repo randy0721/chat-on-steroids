@@ -30,7 +30,7 @@ function mountUser(dom: JSDOM, id: string, text: string) {
   return { holder, raw };
 }
 
-it('replaces a newly sent COS transport frame with only the authored request before Fiber source recovery', async () => {
+it('guards a newly sent COS transport frame with authored-only presentation before Fiber source recovery', async () => {
   const dom = page();
   try {
     const old = mountUser(dom, 'old-user', 'Earlier request');
@@ -42,23 +42,51 @@ it('replaces a newly sent COS transport frame with only the authored request bef
     dom.window.document.querySelector<HTMLButtonElement>('[data-testid="send-button"]')!.click();
 
     // Model the live Markdown renderer consuming transport-only whitespace. The strict DOM
-    // parser cannot recover this frame on its own; the pre-send receipt still can.
+    // parser cannot recover this frame on its own; the pre-send exact value still can.
     const rendered = sent.replace('context.  ', 'context.');
     const current = mountUser(dom, 'new-user', rendered);
     await Promise.resolve();
 
-    expect(old.raw.hasAttribute('data-clf-prompt-hidden')).toBe(false);
-    expect(current.raw.hasAttribute('data-clf-prompt-hidden')).toBe(true);
+    expect(old.raw.hasAttribute('data-clf-context-guard')).toBe(false);
+    expect(current.raw.hasAttribute('data-clf-context-guard')).toBe(true);
+    expect(current.raw.getAttribute('data-clf-context-authored')).toBe('List C:\\Users\\xnn36');
+    // Presentation is CSS-only: recorder/receipt readers still see the native transport text.
     expect(current.raw.textContent).toBe(rendered);
-    expect(current.raw.nextElementSibling?.getAttribute('data-clf-user-text')).not.toBeNull();
-    expect(current.raw.nextElementSibling?.textContent).toBe('List C:\\Users\\xnn36');
+    expect(current.raw.nextElementSibling).toBeNull();
+    expect(dom.window.document.querySelector('#clf-context-guard-style')?.textContent).toContain('visibility: hidden !important');
   } finally {
     (dom.window as any).__CLF_CONTEXT_GUARD__?.stop();
     dom.window.close();
   }
 });
 
-it('does not hide ordinary or invalid marker-like user input', async () => {
+it('hands a guarded message to the normal exact-source presenter when Fiber catches up', async () => {
+  const dom = page();
+  try {
+    const sent = prependUserPrompt('Visible request', 'Private CoS routing context.  ');
+    const editor = dom.window.document.querySelector('#prompt-textarea') as HTMLElement;
+    editor.textContent = sent;
+    dom.window.document.querySelector<HTMLButtonElement>('[data-testid="send-button"]')!.click();
+    const current = mountUser(dom, 'new-user', sent.replace('context.  ', 'context.'));
+    await Promise.resolve();
+    expect(current.raw.hasAttribute('data-clf-context-guard')).toBe(true);
+
+    const api = (dom.window as any).CLF_DOM;
+    api.presentUserPrompts((message: { id: string }) => message.id === 'new-user' ? sent : null);
+    await Promise.resolve();
+
+    expect(current.raw.hasAttribute('data-clf-prompt-hidden')).toBe(true);
+    expect(current.raw.nextElementSibling?.getAttribute('data-clf-user-text')).not.toBeNull();
+    expect(current.raw.nextElementSibling?.textContent).toBe('Visible request');
+    expect(current.raw.hasAttribute('data-clf-context-guard')).toBe(false);
+    expect(current.raw.hasAttribute('data-clf-context-authored')).toBe(false);
+  } finally {
+    (dom.window as any).__CLF_CONTEXT_GUARD__?.stop();
+    dom.window.close();
+  }
+});
+
+it('does not guard ordinary or invalid marker-like user input', async () => {
   const dom = page();
   try {
     const editor = dom.window.document.querySelector('#prompt-textarea') as HTMLElement;
@@ -67,8 +95,8 @@ it('does not hide ordinary or invalid marker-like user input', async () => {
     const current = mountUser(dom, 'literal-user', editor.textContent || '');
     await Promise.resolve();
 
-    expect(current.raw.hasAttribute('data-clf-prompt-hidden')).toBe(false);
-    expect(current.raw.nextElementSibling?.matches('[data-clf-user-text]')).not.toBe(true);
+    expect(current.raw.hasAttribute('data-clf-context-guard')).toBe(false);
+    expect(current.raw.hasAttribute('data-clf-context-authored')).toBe(false);
   } finally {
     (dom.window as any).__CLF_CONTEXT_GUARD__?.stop();
     dom.window.close();
