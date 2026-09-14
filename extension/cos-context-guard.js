@@ -9,14 +9,18 @@
  *
  * The one moment we already possess the exact bytes is immediately before Send. Capture a
  * valid frame there, remember which user messages already exist, and when the corresponding
- * new user bubble mounts, apply the same presentation shape used by chatgpt-dom.js: hide the
- * native renderer and put only the authored request beside it. Native message bytes are never
- * changed, so receipts, recording and provider input keep the full frame.
+ * new user bubble mounts, visually replace it with only the authored request. This guard uses
+ * CSS generated content rather than another text node: recorder/receipt textContent therefore
+ * remains the native message, and the normal exact-source presenter can take over later.
  */
 (() => {
   'use strict';
 
+  try { globalThis.__CLF_CONTEXT_GUARD__?.stop?.(); } catch { /* replacement is best effort */ }
+
   const MAX_PENDING_MS = 30_000;
+  const MAX_KNOWN = 32;
+  const STYLE_ID = 'clf-context-guard-style';
   const USER = '[data-message-author-role="user"]';
   const RAW = '.whitespace-pre-wrap:not([data-clf-user-text]), .markdown:not([data-clf-user-text])';
   const SEND = 'button[data-testid="send-button"], button[data-testid="composer-submit-button"], form button[aria-label^="Send" i]';
@@ -25,6 +29,36 @@
 
   let pending = null;
   let observer = null;
+  const known = new Map();
+
+  function installStyle() {
+    document.getElementById(STYLE_ID)?.remove();
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      [data-clf-context-guard] {
+        visibility: hidden !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+      }
+      [data-clf-context-guard] > * {
+        display: none !important;
+      }
+      [data-clf-context-guard]::after {
+        display: block !important;
+        visibility: visible !important;
+        content: attr(data-clf-context-authored);
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere;
+        font-family: var(--clf-context-font-family, inherit) !important;
+        font-size: var(--clf-context-font-size, 1rem) !important;
+        font-weight: var(--clf-context-font-weight, 400) !important;
+        line-height: var(--clf-context-line-height, 1.5) !important;
+        color: var(--clf-context-color, currentColor) !important;
+      }
+    `;
+    (document.head || document.documentElement).append(style);
+  }
 
   function editorText(editor) {
     if (!editor) return '';
@@ -49,7 +83,6 @@
 
     const existing = currentUserMessages();
     pending = {
-      raw,
       authored,
       at: Date.now(),
       beforeIds: new Set(existing.map(node => node.getAttribute('data-message-id')).filter(Boolean)),
@@ -57,20 +90,56 @@
     };
   }
 
+  function remember(id, authored) {
+    if (!id) return;
+    known.delete(id);
+    known.set(id, authored);
+    while (known.size > MAX_KNOWN) known.delete(known.keys().next().value);
+  }
+
+  function clearGuard(raw) {
+    raw.removeAttribute('data-clf-context-guard');
+    raw.removeAttribute('data-clf-context-authored');
+    for (const name of [
+      '--clf-context-font-family', '--clf-context-font-size', '--clf-context-font-weight',
+      '--clf-context-line-height', '--clf-context-color'
+    ]) raw.style?.removeProperty?.(name);
+  }
+
   function present(raw, authored) {
-    let display = raw.nextElementSibling?.matches?.('[data-clf-user-text]') ? raw.nextElementSibling : null;
-    if (!display) {
-      display = document.createElement('div');
-      display.setAttribute('data-clf-user-text', '');
-      display.className = 'whitespace-pre-wrap';
-      display.dir = 'auto';
-      raw.after(display);
+    // If the normal presenter already has exact provider bytes, it owns this bubble. Its
+    // sibling is real DOM text that follows ChatGPT's typography exactly; the guard is only
+    // the pre-Fiber fallback.
+    if (raw.hasAttribute('data-clf-prompt-hidden') && raw.nextElementSibling?.matches?.('[data-clf-user-text]')) {
+      clearGuard(raw);
+      return;
     }
-    if (display.textContent !== authored) display.textContent = authored;
-    raw.setAttribute('data-clf-prompt-hidden', '');
+    let computed = null;
+    try { computed = getComputedStyle(raw); } catch { /* structural test DOM */ }
+    if (computed) {
+      raw.style.setProperty('--clf-context-font-family', computed.fontFamily || 'inherit');
+      raw.style.setProperty('--clf-context-font-size', computed.fontSize || '1rem');
+      raw.style.setProperty('--clf-context-font-weight', computed.fontWeight || '400');
+      raw.style.setProperty('--clf-context-line-height', computed.lineHeight || '1.5');
+      raw.style.setProperty('--clf-context-color', computed.color || 'currentColor');
+    }
+    raw.setAttribute('data-clf-context-authored', authored);
+    raw.setAttribute('data-clf-context-guard', '');
+  }
+
+  function reconcileKnown() {
+    for (const holder of document.querySelectorAll(`${USER}[data-message-id]`)) {
+      const id = holder.getAttribute('data-message-id');
+      const authored = id ? known.get(id) : null;
+      if (authored === undefined || authored === null) continue;
+      const raw = holder.querySelector(RAW);
+      if (!raw) continue;
+      present(raw, authored);
+    }
   }
 
   function tryPresent() {
+    reconcileKnown();
     const shot = pending;
     if (!shot) return;
     if (Date.now() - shot.at > MAX_PENDING_MS) {
@@ -91,6 +160,7 @@
       const visible = String(raw.textContent || '').trimStart();
       if (!FRAME_HEAD.test(visible)) continue;
       present(raw, shot.authored);
+      remember(id, shot.authored);
       pending = null;
       return;
     }
@@ -114,6 +184,7 @@
     captureFrame();
   }
 
+  installStyle();
   document.addEventListener('click', onClick, true);
   document.addEventListener('submit', onSubmit, true);
   document.addEventListener('keydown', onKeydown, true);
@@ -133,6 +204,9 @@
       observer?.disconnect();
       observer = null;
       pending = null;
+      known.clear();
+      document.getElementById(STYLE_ID)?.remove();
+      for (const raw of document.querySelectorAll('[data-clf-context-guard]')) clearGuard(raw);
     }
   };
 })();
