@@ -84,7 +84,7 @@ import {
   recordAgentMessage,
   recordToolCall
 } from '../session/recorder.js';
-import { requestCorrelation } from '../session/correlation.js';
+import { awaitRequestExecution, requestCorrelation } from '../session/correlation.js';
 import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBackgroundExecOutput } from '../codex/ownership.js';
@@ -92,6 +92,8 @@ import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { unattributedRepairEta } from '../bridge.js';
 import { conversationAttachment, readOverflowText } from '../session/store.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
+import { executionAdmission, requiresExecutionContext } from '../nodes/router.js';
+import { routeExecutionTool } from '../nodes/backend.js';
 
 export interface ToolContext {
   exposedFinishTool?: boolean;
@@ -332,6 +334,7 @@ function setCallerConversation(context: CallContext, conversationId: string | nu
   context.caller.conversationId = conversationId;
   const exact = conversationId ? requestCorrelation(context.caller.requestId) : null;
   context.caller.sessionId = exact?.conversationId === conversationId ? exact.sessionId : null;
+  context.execution = exact?.conversationId === conversationId ? exact.executionSnapshot ?? null : null;
 }
 
 /** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
@@ -513,6 +516,7 @@ export async function dispatch(
     transportKey,
     agent: null,
     caller: parent ? { ...parent.caller } : { transportKey, requestId, conversationId: null, sessionId: null },
+    execution: parent?.execution ?? null,
     outcome: null,
     evidence: emptyEvidence()
   };
@@ -561,18 +565,21 @@ async function dispatchTracked(
   surfaceToolCallAt.set(surface, Date.now());
   const isFinish = isFinishCall(name, args);
   const startedAt = context.startedAt;
-  // Cheap, non-blocking ingress identity. When the page has already reported this exact
-  // request id, identity-sensitive handlers (workspace/session/agents) see it before they
-  // touch state. If the page is one tick late this stays null; only handlers that actually
-  // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
+  // Cheap ingress identity first. Computer execution then waits, when necessary, for this
+  // exact request owner to be strengthened with the exact durable input snapshot. A path or
+  // workdir can make an operation self-contained inside one machine; it cannot answer which
+  // machine owns the call, so computer tools never use the old unattributed/local shortcut.
   if (!nested) setCallerConversation(context, callerConversation(name, startedAt, requestId));
+  if (!nested && requestId && requiresExecutionContext(surface, name, args) && !context.execution) {
+    const exactExecution = await awaitRequestExecution(requestId, REQUEST_ID_GRACE_MS);
+    if (exactExecution) setCallerConversation(context, exactExecution.conversationId);
+  }
   // Only calls that need an *existing* per-chat workspace before the handler runs are
-  // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
-  // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply
-  // declines to learn a guessed workspace. Relative paths, omitted exec workdir and a patch with
-  // no explicit base really do consume caller state, so they wait for their exact request-id
-  // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
-  // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
+  // identity-sensitive here for workspace policy. Computer routing has already resolved its
+  // stronger request->input authority above; these older waits remain for non-computer callers
+  // whose relative/defaulted workspace is itself chat-owned state. Use the full exact-id window,
+  // not the shorter prime window: the live worker failure that motivated IDENTITY_EVIDENCE_MS
+  // arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
   // update_plan always consumes this exact session, even outside a swarm. Resolve it
   // before the shared blocked/superseded checks rather than guessing from selection.
@@ -742,6 +749,7 @@ async function dispatchTracked(
     await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt, explicitPoll);
   }
   let handlerRan = false;
+  const routingError = await executionAdmission(context, surface, name, args);
   markTiming('identity');
   const invokeHandler = (): Promise<ToolResult> => {
     handlerRan = true;
@@ -788,6 +796,8 @@ async function dispatchTracked(
           )
         : nested && (name === 'exec' || name === 'session_finish' || isFinish)
         ? Promise.resolve(fail('DIRECT_CALL_REQUIRED: call this lifecycle tool directly, outside exec. No action was taken.'))
+        : routingError
+        ? Promise.resolve(fail(routingError.message))
         : invokeHandler()
   );
   markTiming('handler');
@@ -1156,16 +1166,19 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
     },
     register(name, config, handler) {
       names.push(name);
-      handlers.set(name, { description: config.description, run: async args => {
+      const runRegistered = async (args: unknown): Promise<ToolResult> => {
         const parsed = await config.inputSchema.safeParseAsync(args);
-        if (parsed.success) return handler(parsed.data);
+        if (parsed.success) {
+          return routeExecutionTool(surface, name, parsed.data, () => handler(parsed.data));
+        }
         // Preserve the schema owner's corrective explanation for code-mode children too.
         // Zod issues omit input values; bound paths/messages and the number of diagnostics.
         const details = parsed.error.issues.slice(0, 3).map(issue =>
           `${issue.path.map(String).join('.').slice(0, 80) || 'arguments'}: ${issue.message.slice(0, 300)}`
         ).join('; ');
         return fail(`INVALID_ARGUMENTS: ${details}`);
-      } });
+      };
+      handlers.set(name, { description: config.description, run: runRegistered });
       observe?.(name, config);
       // No identity field is ever added here. Every tool's schema is exactly what its
       // surface declared: who is calling is a fact about the conversation, established from
@@ -1176,7 +1189,7 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
         dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
+          runRegistered(args)
         )) as never);
     },
     guarded(cap, name, fn) {

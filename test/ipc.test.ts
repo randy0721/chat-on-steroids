@@ -58,7 +58,7 @@ const {
   sendMessage,
   snapshotRetiredWorkers,
   snapshotSwarm,
-  spawn,
+  spawn: spawnWithoutExecutionProof,
   swarmStateForCaller
 } = await import('../src/main/agents.js');
 const { registerIpc } = await import('../src/main/ipc.js');
@@ -84,6 +84,23 @@ const renameRoot = (payload: unknown): Promise<any> => handlers.get('roots:renam
 const removeRoot = (payload: unknown): Promise<any> => handlers.get('roots:remove')!(null, payload) as Promise<any>;
 const sessionEvents = (payload: unknown): Promise<any> => handlers.get('sessions:events')!(null, payload) as Promise<any>;
 const sessionList = (): Promise<any> => handlers.get('sessions:list')!(null, undefined) as Promise<any>;
+
+/**
+ * These IPC fixtures exercise retained-worker lifecycle rather than execution-proof refusal.
+ * Production callers supply an exact frozen target through the MCP call context, so keep the
+ * synthetic worker openings on that same contract instead of reviving the old proofless seam.
+ */
+function spawn(input: Parameters<typeof spawnWithoutExecutionProof>[0]): ReturnType<typeof spawnWithoutExecutionProof> {
+  return spawnWithoutExecutionProof({
+    ...input,
+    executionTarget: input.executionTarget ?? {
+      nodeId: 'local',
+      workspace: null,
+      bindingVersion: 1,
+      nodeConfigVersion: 1
+    }
+  });
+}
 
 it('switches setup IDs and encrypted key ownership without changing shared settings', async () => {
   const { getSecret } = await import('../src/main/secrets.js');
@@ -403,9 +420,10 @@ describe('turning multi-agent mode off', () => {
   it('cancels the run’s queued worker chats before the bridge goes away', async () => {
     await startBridge();
     spawn({ workers: [{ task: 'work' }], caller: { conversationId: 'c-prime' } });
-    // Opening is asynchronous, as it is in the app.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(pendingCommands().length).toBe(1);
+    // Exact execution proof is frozen before the browser command is published, so opening is
+    // intentionally asynchronous. Wait for that exact queued command rather than one event-loop
+    // tick from the legacy proofless path.
+    await vi.waitFor(() => expect(pendingCommands()).toHaveLength(1));
 
     // Recording off as well, so this really is the case where the bridge is shut down.
     await save(settings({ record: false, multiAgent: false }));

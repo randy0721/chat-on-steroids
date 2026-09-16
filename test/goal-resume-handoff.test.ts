@@ -17,6 +17,7 @@ const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
 const {
   appendEvent,
+  bindSessionExecutionTarget,
   createSession,
   getSession,
   initSessionStore,
@@ -76,6 +77,11 @@ it('sends the Compact & Resume handoff to Goal as chat B actually received it', 
   const from = 'aaaaaaaa-1111-4111-8111-111111111111';
   const to = 'bbbbbbbb-2222-4222-8222-222222222222';
   const session = await createSession({ title: 'release work', conversationId: from });
+  const target = await bindSessionExecutionTarget(session.id, {
+    nodeId: 'office-windows',
+    workspace: 'C:\\release',
+    nodeConfigVersion: 19
+  });
   const original = 'Finish the release, preserve the current worker state, and prove the native paths are green.';
   const handoffText =
     'HANDOFF: The release work is still active. Native app and extension parity are implemented, the shared worker state must be preserved, and the remaining task is to finish verification without replaying old history into the replacement chat. '.repeat(2);
@@ -108,7 +114,10 @@ it('sends the Compact & Resume handoff to Goal as chat B actually received it', 
     reason: 'compact and resume'
   });
   expect(await rebindSession(session.id, from, to, handoff.id)).toBe(true);
+  expect((await getSession(session.id))?.executionTarget).toEqual(target);
   const bootstrap = resumeBootstrapText(handoff.text);
+  expect(bootstrap).not.toContain('office-windows');
+  expect(bootstrap).not.toContain('C:\\release');
   // Successful resume observation normally records the actual user row too. Goal must not emit
   // both this row and its structured handoff fallback as two copies of one bootstrap.
   await appendEvent(session.id, {
@@ -135,6 +144,7 @@ it('sends the Compact & Resume handoff to Goal as chat B actually received it', 
 
   goal.startGoalDraft({ sessionId: session.id, conversationId: to, turnId: 'goal-after-resume' });
   expect((await settled(to)).stage).toBe('no-reply');
+  expect((await getSession(session.id))?.executionTarget).toEqual(target);
 
   // Inspect the actual provider payload, not just conversationMessages()/handoff metadata.
   const transcript = referenceTranscript(requestMessages);

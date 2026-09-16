@@ -21,6 +21,8 @@ import { getChatModels } from './chat-models.js';
 import type { ChatModelOption } from '../shared/chat-models.js';
 import { logInfo, logWarn } from './logger.js';
 import { inheritWorkspace, releasePrimeWorkspace, bindAgentWorkspace } from './workspace.js';
+import { executionTargetSchema, type ExecutionTarget } from '../shared/nodes.js';
+import { currentCall } from './mcp/call-context.js';
 
 export const PRIME_ID = 'prime';
 
@@ -207,6 +209,8 @@ function canStop(state: AgentState): boolean {
 interface Agent {
   info: AgentInfo;
   queue: AgentMessage[];
+  /** Exact prime execution target captured when this worker invitation was accepted. */
+  bootstrapExecutionTarget: ExecutionTarget | null;
 }
 
 /**
@@ -513,6 +517,8 @@ export interface WorkerSpawn {
   model: string | null;
   /** Requested reasoning level, or null to inherit the default. */
   reasoningEffort: ReasoningEffort | null;
+  /** Frozen routing intent captured at spawn acceptance, never a later UI/current selection. */
+  executionTarget: ExecutionTarget | null;
 }
 
 /** Workers that exist but have not joined: their chat is still owed. */
@@ -522,7 +528,15 @@ export function pendingWorkerSpawns(): WorkerSpawn[] {
       (agent) =>
         agent.info.role === 'worker' && agent.info.state === 'invited' && !unpublishedAgents.has(agent)
     )
-    .map((agent) => ({ runId: run.runId, primeConversationId: run.primeConversationId, id: agent.info.id, task: agent.info.task, model: agent.info.model, reasoningEffort: agent.info.reasoningEffort })));
+    .map((agent) => ({
+      runId: run.runId,
+      primeConversationId: run.primeConversationId,
+      id: agent.info.id,
+      task: agent.info.task,
+      model: agent.info.model,
+      reasoningEffort: agent.info.reasoningEffort,
+      executionTarget: agent.bootstrapExecutionTarget ? { ...agent.bootstrapExecutionTarget } : null
+    })));
 }
 
 /**
@@ -848,7 +862,8 @@ function makeWorker(id: string, label: string, task: string, model: string | nul
       sleptAt: null,
       contextTokens: 0
     },
-    queue: []
+    queue: [],
+    bootstrapExecutionTarget: null
   };
 }
 
@@ -876,7 +891,8 @@ function makePrime(conversationId: string): Agent {
       sleptAt: null,
       contextTokens: 0
     },
-    queue: []
+    queue: [],
+    bootstrapExecutionTarget: null
   };
 }
 
@@ -1050,6 +1066,8 @@ export interface SpawnInput {
    */
   context?: string | null;
   caller: Caller;
+  /** Exact execution target proven for the spawning call, when available. */
+  executionTarget?: ExecutionTarget | null;
 }
 
 export interface SpawnResult {
@@ -1226,7 +1244,15 @@ export function requestWorkerBootstraps(ids: readonly string[], runId?: string):
         !unpublishedAgents.has(agent) &&
         wanted.has(agent.info.id)
     )
-    .map((agent) => ({ runId: run.runId, primeConversationId: run.primeConversationId, id: agent.info.id, task: agent.info.task, model: agent.info.model, reasoningEffort: agent.info.reasoningEffort }));
+    .map((agent) => ({
+      runId: run.runId,
+      primeConversationId: run.primeConversationId,
+      id: agent.info.id,
+      task: agent.info.task,
+      model: agent.info.model,
+      reasoningEffort: agent.info.reasoningEffort,
+      executionTarget: agent.bootstrapExecutionTarget ? { ...agent.bootstrapExecutionTarget } : null
+    }));
   if (owed.length === 0) return 0;
   if (spawnRequest) spawnRequest(owed);
   else logWarn('multi-agent: no browser extension is paired, so worker chats cannot be opened automatically');
@@ -1262,6 +1288,21 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
   if (context.length > MAX_CONTEXT_CHARS) {
     throw new AgentError(`The shared context is too long (limit ${MAX_CONTEXT_CHARS} characters)`);
   }
+  const call = currentCall();
+  const currentExecution =
+    call?.caller.conversationId && call.caller.conversationId === input.caller.conversationId
+      ? call.execution ?? null
+      : null;
+  const spawnExecutionTarget = input.executionTarget
+    ? executionTargetSchema.parse(input.executionTarget)
+    : currentExecution
+      ? executionTargetSchema.parse({
+          nodeId: currentExecution.nodeId,
+          workspace: currentExecution.workspace,
+          bindingVersion: currentExecution.bindingVersion,
+          nodeConfigVersion: currentExecution.nodeConfigVersion
+        })
+      : null;
 
   const observedModels = getChatModels().models;
   const planned = input.workers.map((worker, index) => {
@@ -1378,6 +1419,7 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
   for (const [index, worker] of planned.entries()) {
     const id = ids[index] as string;
     const agent = makeWorker(id, worker.label || id, worker.task, worker.model, worker.reasoningEffort);
+    agent.bootstrapExecutionTarget = spawnExecutionTarget ? { ...spawnExecutionTarget } : null;
     activeRun.agents.set(id, agent);
     stampOwner(activeRun);
     // A worker starts in the folder the prime was working in, so its first call can use the
@@ -3798,6 +3840,8 @@ export function restoreRetiredWorkers(snapshot: RetiredWorkersSnapshot | null): 
 interface SerializedAgent {
   info: AgentInfo;
   queue: AgentMessage[];
+  /** Worker bootstrap routing proof; absent on legacy snapshots and prime rows. */
+  bootstrapExecutionTarget?: ExecutionTarget;
 }
 
 interface DormantRunSnapshot {
@@ -3904,7 +3948,11 @@ function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean
       if (includeUnpublished && agent.info.id === PRIME_ID) {
         queue.push(...stagedFinishes.map((stage) => ({ ...stage.report })));
       }
-      return { info, queue };
+      return {
+        info,
+        queue,
+        ...(agent.bootstrapExecutionTarget ? { bootstrapExecutionTarget: { ...agent.bootstrapExecutionTarget } } : {})
+      };
     });
 }
 
@@ -4065,6 +4113,7 @@ function deserializeAgents(entries: readonly SerializedAgent[], savedAt: number)
       repaired = true;
       continue;
     }
+    const target = executionTargetSchema.safeParse(entry.bootstrapExecutionTarget);
     const agent: Agent = {
       info: {
         ...entry.info,
@@ -4085,7 +4134,8 @@ function deserializeAgents(entries: readonly SerializedAgent[], savedAt: number)
             : null,
         offeredOnFinish: message.offeredOnFinish ?? false,
         offeredViaRevival: message.offeredViaRevival === true
-      }))
+      })),
+      bootstrapExecutionTarget: target.success ? target.data : null
     };
     if (agent.info.role === 'worker') {
       if (agent.info.state === 'invited' && agent.info.conversationId) {

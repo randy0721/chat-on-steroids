@@ -947,19 +947,30 @@
   function requestIdsOf(messages) {
     if (!Array.isArray(messages)) return [];
     const out = [];
-    const seen = new Set();
+    const seen = new Map();
+    const conflicts = new Set();
     for (let at = 0; at < messages.length && out.length < MAX_CALLS; at++) {
       const message = messages[at];
       if (!message || typeof message !== 'object') continue;
       const meta = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
       const requestId = meta ? str(meta.request_id) : null;
-      if (!requestId || seen.has(requestId)) continue;
-      seen.add(requestId);
-      out.push({
+      if (!requestId) continue;
+      const userMessageId = message.author?.role === 'user' ? str(message.id) : null;
+      const prior = seen.get(requestId);
+      if (prior) {
+        if (userMessageId && prior.userMessageId && prior.userMessageId !== userMessageId) conflicts.add(requestId);
+        if (userMessageId && !conflicts.has(requestId)) prior.userMessageId = userMessageId;
+        if (conflicts.has(requestId)) delete prior.userMessageId;
+        continue;
+      }
+      const request = {
         requestId,
         messageId: str(message.id),
-        createTime: num(message.create_time)
-      });
+        createTime: num(message.create_time),
+        ...(userMessageId ? { userMessageId } : {})
+      };
+      seen.set(requestId, request);
+      out.push(request);
     }
     return out;
   }

@@ -66,4 +66,5 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  */
 // 13 — native file attachments require exact claimed-input chunk delivery and final
 // draft ownership. A 12 companion would silently send text without these files.
-export const BRIDGE_PROTOCOL = 13;
+// 14 — 工具请求必须携带与用户消息精确关联的 execution proof；旧扩展不能可靠补齐此身份。
+export const BRIDGE_PROTOCOL = 14;

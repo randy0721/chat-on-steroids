@@ -8483,6 +8483,41 @@ describe('evidence from the page context', () => {
     );
     expect(evidence.some((entry) => entry.fiberConversationId === staleConversation)).toBe(false);
   });
+  it('strengthens early SSE ownership with the exact user request from a separate Fiber turn', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_split_execution';
+    live.reply.set('correlate', () => ({ ok: true, data: { conversationId, confirmed: [requestId], complete: true } }));
+    const calls = [{ messageId: 'assistant-call', tool: 'read', order: 0, answered: false, requestId }];
+    const assistant = { turnId: 'assistant-execution', conversationId, calls };
+    await replyFiber([], [assistant]);
+    expect(live.sent.filter(message => message.type === 'correlate')).toHaveLength(1);
+    await replyFiber([], [
+      { turnId: 'user-execution', conversationId, calls: [], requests: [{ requestId, messageId: 'exact-user', userMessageId: 'exact-user' }] },
+      assistant
+    ]);
+    const handshakes = live.sent.filter(message => message.type === 'correlate');
+    expect(handshakes).toHaveLength(2);
+    expect(handshakes[1]).toMatchObject({ calls: [{ requestId, userMessageId: 'exact-user' }] });
+    await replyFiber([], [
+      { turnId: 'user-execution', conversationId, calls: [], requests: [{ requestId, messageId: 'exact-user', userMessageId: 'exact-user' }] },
+      assistant
+    ]);
+    expect(live.sent.filter(message => message.type === 'correlate')).toHaveLength(2);
+  });
+
+  it('does not infer a user target from a neighboring turn with a different provider request', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live.reply.set('correlate', () => ({ ok: true, data: { conversationId, confirmed: ['wfr_call', 'wfr_other'], complete: true } }));
+    await replyFiber([], [
+      { turnId: 'user', conversationId, calls: [], requests: [{ requestId: 'wfr_other', messageId: 'other-user', userMessageId: 'other-user' }] },
+      { turnId: 'assistant', conversationId, calls: [{ messageId: 'call', tool: 'read', order: 0, answered: false, requestId: 'wfr_call' }] }
+    ]);
+    const calls = live.sent.filter(message => message.type === 'correlate').flatMap(message => message.calls as any[]);
+    expect(calls.find(call => call.requestId === 'wfr_call')?.userMessageId).toBeUndefined();
+  });
+
   it('explicitly confirms a live request against the real chat id while a fresh client thread is still provisional', async () => {
     live = await harness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';

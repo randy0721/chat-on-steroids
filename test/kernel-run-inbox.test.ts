@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 const broker = vi.hoisted(() => ({ offer: vi.fn(), ack: vi.fn(), bareOffer: vi.fn(), bareAck: vi.fn(), release: vi.fn(), alive: vi.fn(), record: vi.fn() }));
@@ -16,13 +17,16 @@ vi.mock('../src/main/session/recorder.js', async (original) => ({
   recordToolCall: async () => null, recordAgentMessage: broker.record
 }));
 vi.mock('../src/main/session/store.js', async (original) => ({
-  ...await original<typeof import('../src/main/session/store.js')>(), conversationAttachment: async () => 'current'
+  ...await original<typeof import('../src/main/session/store.js')>(), conversationAttachment: async () => 'current',
+  getSession: async (id: string) => ({ id, executionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 } })
 }));
 vi.mock('../src/main/session/input.js', () => ({ offerToolInput: async () => ({ messages: [], reminder: '' }), acknowledgeToolInput: async () => undefined, TOOL_INPUT_HEADER: '\n--- New instructions from the user ---\n' }));
 import { createRegistrar, dispatch, ok } from '../src/main/mcp/kernel.js';
 import { currentCall } from '../src/main/mcp/call-context.js';
 import { withInboundRequestId } from '../src/main/mcp/inbound.js';
 import { defaultConfig } from '../src/main/config.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 beforeEach(() => {
   vi.clearAllMocks();
   broker.alive.mockReturnValue(null);
@@ -65,7 +69,18 @@ it('does not fall back to a friendly-id inbox when exact conversation ownership 
 it('offers and acknowledges the worker inbox only on the outer call, outside nested filtering', async () => {
   const registrar = createRegistrar(null, { roots: [], caps: defaultConfig().capabilities, readOnly: true }, 'core');
   registrar.register('read', { description: 'fixture', inputSchema: z.object({}) }, async () => ok('private tool value'));
-  const result = await dispatch('exec', {}, null, 'req-chat-a', 'core', async () => {
+  const requestId = 'req-chat-a-nested';
+  const conversationId = 'chat-a-nested';
+  const sessionId = 'session-chat-a-nested';
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(
+    { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 }, sessionId, inputId
+  );
+  expect(observeRequestCorrelation({
+    requestId, conversationId, sessionId, inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'exec', observedAt: Date.now()
+  })).toBe('stored');
+  const result = await dispatch('exec', {}, null, requestId, 'core', async () => {
     const parent = currentCall()!;
     const children = await Promise.all([registrar.invokeNested('read', {}, parent), registrar.invokeNested('read', {}, parent)]);
     expect(children).toEqual([ok('private tool value'), ok('private tool value')]);
@@ -75,6 +90,6 @@ it('offers and acknowledges the worker inbox only on the outer call, outside nes
   });
   expect(broker.offer).toHaveBeenCalledTimes(1);
   expect(broker.ack).toHaveBeenCalledTimes(1);
-  expect(JSON.stringify(result)).toContain('private-chat-a');
+  expect(JSON.stringify(result)).toContain('private-chat-a-nested');
   expect(JSON.stringify(result)).not.toContain('private tool value');
 });

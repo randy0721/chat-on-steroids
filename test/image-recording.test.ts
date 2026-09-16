@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { flushRecorder, resetRecorderForTests, sessionForConversation } from '../src/main/session/recorder.js';
 import * as store from '../src/main/session/store.js';
@@ -26,7 +27,12 @@ beforeEach(async () => {
   const conversationId = randomUUID();
   sessionId = (await sessionForConversation(conversationId))!;
   requestId = randomUUID();
-  observeRequestCorrelation({ requestId, conversationId, sessionId, messageId: randomUUID(), observedAt: Date.now(), tool: 'view_image' });
+  const session = await store.getSession(sessionId);
+  if (!session?.executionTarget) throw new Error('image fixture session is missing its execution target');
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(session.executionTarget, sessionId, inputId);
+  observeRequestCorrelation({ requestId, conversationId, sessionId, inputId, executionSnapshot,
+    messageId: randomUUID(), observedAt: Date.now(), tool: 'view_image' });
   endpoint = await startMcpServer(() => ({ roots: [{ name: 'workspace', path: root }],
     caps: config.capabilities, readOnly: false, sessionTools: false, agentTools: false }));
 });

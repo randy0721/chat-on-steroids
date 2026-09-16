@@ -7,7 +7,7 @@
  * (registration, _meta fileParams, TOOL_DISABLED gating).
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -24,6 +24,10 @@ import {
 } from '../src/main/mcp/artifact-target.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import type { ToolContext } from '../src/main/mcp/tools.js';
+import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { createSession, initSessionStore, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { resetWorkspaces } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -357,7 +361,7 @@ describe('download_artifact MCP surface', () => {
 
   const withCaps = (overrides: Partial<Capabilities>): Capabilities => ({ ...DEFAULT_CAPABILITIES, ...overrides });
 
-  function rawCall(body: string): Promise<{ status: number; parsed: any }> {
+  function rawCall(body: string, requestId?: string): Promise<{ status: number; parsed: any }> {
     const url = new URL(endpoint.urls.core);
     return new Promise((resolve, reject) => {
       const req = http.request(
@@ -369,7 +373,8 @@ describe('download_artifact MCP surface', () => {
           headers: {
             'content-type': 'application/json',
             accept: 'application/json, text/event-stream',
-            'content-length': Buffer.byteLength(body)
+            'content-length': Buffer.byteLength(body),
+            ...(requestId ? { 'x-request-id': requestId } : {})
           }
         },
         (res) => {
@@ -402,10 +407,14 @@ describe('download_artifact MCP surface', () => {
     base = await makeTempDir('clf-artifact-mcp-');
     approved = path.join(base, 'workspace');
     await fs.mkdir(approved, { recursive: true });
+    initDurableStore(base);
+    initSessionStore(base);
   });
 
   afterAll(async () => {
     if (endpoint) await endpoint.stop();
+    resetSessionStoreForTests();
+    resetDurableForTests();
     await removeTempDir(base);
   });
 
@@ -437,13 +446,23 @@ describe('download_artifact MCP surface', () => {
     expect((await list()).map((t) => t.name)).toContain('download_artifact');
     ctx.caps = withCaps({});
     ctx.readOnly = false;
+    const conversationId = randomUUID();
+    const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+    const session = await createSession({ conversationId, title: 'Artifact permission fixture' });
+    const inputId = randomUUID();
+    const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+    expect(observeRequestCorrelation({
+      requestId, conversationId, sessionId: session.id, inputId, executionSnapshot,
+      messageId: randomUUID(), tool: 'download_artifact', observedAt: Date.now()
+    })).toBe('stored');
     const { parsed } = await rawCall(
       JSON.stringify({
         jsonrpc: '2.0',
         id: nextId++,
         method: 'tools/call',
         params: { name: 'download_artifact', arguments: { file: fileRef(), path: '/workspace/x.bin' } }
-      })
+      }),
+      requestId
     );
     expect(parsed?.result?.isError).toBe(true);
     expect(JSON.stringify(parsed?.result?.content)).toContain('TOOL_DISABLED');

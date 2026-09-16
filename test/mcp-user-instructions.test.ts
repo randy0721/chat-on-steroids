@@ -80,7 +80,10 @@ describe('the user’s own connector instructions', () => {
     expect(intro).toContain('Chat On Steroids Plugins for enabled external apps');
     expect(text.indexOf(intro)).toBeGreaterThan(text.indexOf('# Local tools'));
     expect(text).not.toMatch(/This is Chat On Steroids|https:\/\/chatgpt.com\/#settings\/Plugins/);
-    expect(serverInstructions(ctx, 'core', 'linux')).not.toContain('Chat On Steroids Desktop');
+    const linux = serverInstructions(ctx, 'core', 'linux');
+    expect(linux).toContain('Chat On Steroids Desktop');
+    expect(linux).toContain('Control host: Linux.');
+    expect(linux).toContain('current-turn execution projection is authoritative for target OS, shell, workspace and roots');
   });
   it('adapts upstream instructions without unsupported facilities and projects live tools', () => {
     const text = serverInstructions(ctx, 'core', 'win32');

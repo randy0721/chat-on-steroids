@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 vi.mock('../src/main/session/recorder.js', async original => ({
   ...await original<typeof import('../src/main/session/recorder.js')>(),
@@ -5,10 +6,12 @@ vi.mock('../src/main/session/recorder.js', async original => ({
 }));
 vi.mock('../src/main/session/store.js', async original => ({
   ...await original<typeof import('../src/main/session/store.js')>(),
-  conversationAttachment: async () => 'current'
+  conversationAttachment: async () => 'current',
+  getSession: async (id: string) => ({ id, executionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 } })
 }));
 import { dispatch, ok } from '../src/main/mcp/kernel.js';
 import { currentCall } from '../src/main/mcp/call-context.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 
 it.each(['get_window_state', 'click', 'scroll', 'drag', 'set_value', 'perform_secondary_action'])(
@@ -21,8 +24,14 @@ it.each(['get_window_state', 'click', 'scroll', 'drag', 'set_value', 'perform_se
     const pending = dispatch(name, {}, null, requestId, 'desktop', run);
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(run).not.toHaveBeenCalled();
+    const inputId = randomUUID();
+    const executionSnapshot = freezeLocalExecution(
+      { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 },
+      'desktop-session',
+      inputId
+    );
     observeRequestCorrelation({ requestId, conversationId: 'desktop-chat', sessionId: 'desktop-session',
-      messageId: `message-${name}`, tool: name, observedAt: Date.now() });
+      inputId, executionSnapshot, messageId: `message-${name}`, tool: name, observedAt: Date.now() });
     expect((await pending).isError).not.toBe(true);
     expect(run).toHaveBeenCalledOnce();
   }

@@ -1,11 +1,14 @@
-import { beforeEach, afterEach, expect, it } from 'vitest';
+import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { nodeRegistry } from '../src/main/nodes/registry.js';
 import { addProject, assignSessionProject } from '../src/main/projects.js';
-import { createSession, initSessionStore, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
-import { fitSessionPrompt, prepareSessionPrompt } from '../src/main/session/prompt.js';
+import { bindSessionExecutionTarget, createSession, getSession, initSessionStore, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { executionEnvironmentProjection, fitSessionPrompt, prepareSessionPrompt } from '../src/main/session/prompt.js';
+import type { ExecutionSnapshot, NodeRuntimeInfo } from '../src/shared/nodes.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
@@ -16,6 +19,7 @@ beforeEach(async () => {
   await saveConfig({ ...defaultConfig(), roots: [{ name: 'work', path: directory }] });
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   resetSessionStoreForTests(); resetDurableForTests();
   await removeTempDir(directory);
 });
@@ -85,6 +89,144 @@ it('uses durable session ownership through resume and worker inheritance, never 
   expect(await prepareSessionPrompt('Worker', { sessionId: worker.id })).toContain('PROJECT_ONE_ONLY');
   const unfiled = await createSession({ title: 'Unfiled' });
   expect(await prepareSessionPrompt('Ordinary chat', { sessionId: unfiled.id, projectId: two.id })).not.toContain('PROJECT_TWO_ONLY');
+});
+
+it('inherits a worker execution target from its exact source session without prompt-selected node state', async () => {
+  const prime = await createSession({ title: 'Prime', conversationId: 'prime-node-chat' });
+  const target = await bindSessionExecutionTarget(prime.id, {
+    nodeId: 'office-windows',
+    workspace: 'C:\\work\\crm',
+    nodeConfigVersion: 11
+  });
+  const worker = await createSession({
+    title: 'Worker',
+    origin: { kind: 'worker', fromSessionId: prime.id, agentId: 'worker-1', task: 'Inspect' }
+  });
+
+  expect(worker.executionTarget).toEqual({ ...target, bindingVersion: 1 });
+  await prepareSessionPrompt('Inspect the assigned work', { sessionId: worker.id });
+  expect((await getSession(worker.id))?.executionTarget).toEqual({ ...target, bindingVersion: 1 });
+  expect((await getSession(prime.id))?.executionTarget).toEqual(target);
+});
+
+it('projects remote Windows details only from the exact frozen agent instance', async () => {
+  const session = await createSession({ title: 'Remote projection', conversationId: 'remote-projection-chat' });
+  const target = await bindSessionExecutionTarget(session.id, {
+    nodeId: 'office-windows', workspace: 'C:\\work\\crm', nodeConfigVersion: 7
+  });
+  const execution: ExecutionSnapshot = {
+    ...target,
+    sessionId: session.id,
+    inputId: randomUUID(),
+    machineId: 'machine-office',
+    agentInstanceId: 'agent-frozen'
+  };
+  const exactRuntime: NodeRuntimeInfo = {
+    nodeId: execution.nodeId,
+    machineId: execution.machineId,
+    agentInstanceId: execution.agentInstanceId,
+    platform: 'win32',
+    defaultShell: 'PowerShell 7',
+    approvedRoots: ['C:\\work'],
+    capabilities: ['files', 'terminal', 'desktop'],
+    protocolVersion: 1
+  };
+  const getNode = vi.spyOn(nodeRegistry, 'get').mockResolvedValue({
+    config: { id: execution.nodeId, name: 'Office Windows', transport: 'remote-stdio-ws', configVersion: execution.nodeConfigVersion },
+    state: 'connected', runtimeInfo: exactRuntime, error: null
+  });
+
+  expect(await executionEnvironmentProjection(execution)).toBe([
+    'Current execution environment',
+    '- Target computer: Office Windows (office-windows)',
+    '- System: Windows',
+    '- Default terminal: PowerShell 7',
+    '- Workspace: C:\\work\\crm',
+    '- Approved roots: C:\\work',
+    '- Available computer capabilities: files, terminal, desktop',
+    '- The client has bound computer tools for this turn to this exact target and executor instance; this text is not a machine selector.',
+    '- Historical paths, files, frames and process handles from another target/binding are not authority for this turn.',
+    '- If the bound node is unavailable, report the node error and wait for recovery; never choose or fall back to the local computer or another node.'
+  ].join('\n'));
+
+  getNode.mockResolvedValue({
+    config: { id: execution.nodeId, name: 'Office Windows', transport: 'remote-stdio-ws', configVersion: execution.nodeConfigVersion },
+    state: 'connected',
+    runtimeInfo: {
+      ...exactRuntime,
+      agentInstanceId: 'agent-new',
+      defaultShell: 'NEW_RUNTIME_SHELL',
+      approvedRoots: ['D:\\new-runtime'],
+      capabilities: ['new-runtime-capability']
+    },
+    error: null
+  });
+  const mismatched = await executionEnvironmentProjection(execution);
+  expect(mismatched).toContain('- System: remote node (exact frozen runtime currently unavailable)');
+  expect(mismatched).toContain('- Default terminal: (unavailable until the exact frozen runtime is connected)');
+  expect(mismatched).toContain('- Approved roots: (not advertised)');
+  expect(mismatched).toContain('- Available computer capabilities: (unavailable)');
+  expect(mismatched).not.toMatch(/NEW_RUNTIME_SHELL|D:\\new-runtime|new-runtime-capability/);
+});
+
+it('reads remote AGENTS.md only through the exact frozen Windows connection and never falls back to a local project', async () => {
+  const localFolder = path.join(directory, 'local-project');
+  await fs.mkdir(localFolder);
+  await fs.writeFile(path.join(localFolder, 'AGENTS.md'), 'LOCAL_PROJECT_MUST_NOT_APPEAR');
+  const project = await addProject(localFolder);
+  const session = await createSession({ title: 'Remote instructions', conversationId: 'remote-instructions-chat' });
+  await assignSessionProject(session.id, project.id);
+  const target = await bindSessionExecutionTarget(session.id, {
+    nodeId: 'office-windows', workspace: 'C:\\work\\crm', nodeConfigVersion: 8
+  });
+  const execution: ExecutionSnapshot = {
+    ...target,
+    sessionId: session.id,
+    inputId: randomUUID(),
+    machineId: 'machine-office',
+    agentInstanceId: 'agent-frozen'
+  };
+  const runtime: NodeRuntimeInfo = {
+    nodeId: execution.nodeId,
+    machineId: execution.machineId,
+    agentInstanceId: execution.agentInstanceId,
+    platform: 'win32',
+    defaultShell: 'powershell.exe',
+    approvedRoots: ['C:\\work'],
+    capabilities: ['files'],
+    protocolVersion: 1
+  };
+  const remoteText = 'REMOTE_WINDOWS_ONLY';
+  const callTool = vi.fn(async (request: { name: string; arguments?: Record<string, unknown> }) => {
+    if (request.name === 'get_file_info') {
+      return { structuredContent: { kind: 'file_info', exists: true, isFile: true, size: Buffer.byteLength(remoteText) }, content: [] };
+    }
+    if (request.name === 'read_file') return { content: [{ type: 'text' as const, text: remoteText }] };
+    throw new Error(`unexpected remote tool ${request.name}`);
+  });
+  const lease = vi.spyOn(nodeRegistry, 'withExecutionConnection').mockImplementation(async (expected, operation) => {
+    expect(expected).toMatchObject({
+      nodeId: execution.nodeId,
+      nodeConfigVersion: execution.nodeConfigVersion,
+      machineId: execution.machineId,
+      agentInstanceId: execution.agentInstanceId
+    });
+    return operation({ tools: [{ name: 'get_file_info' }, { name: 'read_file' }], callTool } as never, runtime);
+  });
+
+  const text = await prepareSessionPrompt('Inspect the remote project', { sessionId: session.id, executionSnapshot: execution });
+  expect(text).toContain('# AGENTS.md instructions for C:\\work\\crm');
+  expect(text).toContain(remoteText);
+  expect(text).not.toContain('LOCAL_PROJECT_MUST_NOT_APPEAR');
+  expect(callTool).toHaveBeenCalledTimes(2);
+  expect(callTool.mock.calls.map(([request]) => [request.name, request.arguments?.path])).toEqual([
+    ['get_file_info', 'C:\\work\\crm\\AGENTS.md'],
+    ['read_file', 'C:\\work\\crm\\AGENTS.md']
+  ]);
+
+  lease.mockRejectedValueOnce(Object.assign(new Error('TARGET_CHANGED: agent instance changed'), { code: 'TARGET_CHANGED' }));
+  await expect(prepareSessionPrompt('Retry after remote restart', { sessionId: session.id, executionSnapshot: execution }))
+    .rejects.toThrow(/selected remote folder's AGENTS\.md safely/);
 });
 
 it('bounds a large file and refuses invalid file types and revoked access without injecting their contents', async () => {

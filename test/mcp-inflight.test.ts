@@ -1,10 +1,12 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { getLog } from '../src/main/logger.js';
 import {
   inFlightToolCalls,
@@ -12,7 +14,8 @@ import {
   settlingToolCalls
 } from '../src/main/mcp/call-context.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
-import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { createSession, initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
 // @ts-ignore Diagnostic scripts are intentionally plain ESM JavaScript.
 import { benchmarkMcpLatency } from '../scripts/benchmark-mcp-latency.mjs';
 
@@ -79,10 +82,11 @@ async function serve(): Promise<McpEndpoint> {
   }));
 }
 
-const readNote = (url: string): Promise<Response> =>
+const readNote = (url: string, requestId?: string): Promise<Response> =>
   fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream',
+      ...(requestId ? { 'x-request-id': requestId } : {}) },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -107,7 +111,16 @@ it('counts a call as running until its whole request is done, not just its handl
   // outcome is still being recorded, and the result has not reached ChatGPT. A counter that
   // closed with the handler let a handoff be written into exactly that gap.
   endpoint = await serve();
-  const response = await readNote(endpoint.url);
+  const conversationId = randomUUID();
+  const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+  const session = await createSession({ conversationId, title: 'In-flight exact execution fixture' });
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+  expect(observeRequestCorrelation({
+    requestId, conversationId, sessionId: session.id, inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'read', observedAt: Date.now()
+  })).toBe('stored');
+  const response = await readNote(endpoint.url, requestId);
   expect(response.status).toBe(200);
   expect(await response.text()).toContain('hello');
   expect(getLog().some((entry) => /request POST mcp\/core.*calls=1 ingress_ms=\d+ identity_ms=\d+ handler_ms=\d+ delivery_ms=\d+ recorder_ms=\d+ response_tail_ms=\d+/.test(entry.message))).toBe(true);

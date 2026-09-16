@@ -1,6 +1,48 @@
 import type { ReasoningEffort } from './session.js';
+import type { NodeRuntimeInfo } from './nodes.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from './windows-computer.js';
 /** Types shared between the main process and the renderer. No runtime logic here. */
+
+/** Renderer-safe projection of one execution node. Credentials never cross this boundary. */
+export type RendererNodeStatus = 'local' | 'disconnected' | 'connecting' | 'connected' | 'error';
+
+export interface RendererNodeView {
+  id: string;
+  name: string;
+  transport: 'local' | 'remote-stdio-ws';
+  endpoint: string | null;
+  expectedMachineId: string | null;
+  configVersion: number;
+  credentialConfigured: boolean;
+  status: RendererNodeStatus;
+  runtimeInfo: NodeRuntimeInfo | null;
+}
+
+/** A credential may enter the main process on save, but is never echoed back. */
+export interface RemoteNodeSaveRequest {
+  id: string;
+  name: string;
+  endpoint: string;
+  expectedMachineId?: string;
+  token?: string;
+}
+
+export interface RendererNodeTestResult {
+  node: RendererNodeView;
+  runtimeInfo: NodeRuntimeInfo;
+}
+
+export interface RemoteWorkspaceValidation {
+  nodeId: string;
+  workspace: string;
+  approvedRoot: string;
+}
+
+/** Renderer intent used only while opening a brand-new durable session. */
+export interface OpeningExecutionSelection {
+  nodeId: string;
+  workspace: string | null;
+}
 
 /**
  * One capability per user-facing checkbox. Tools are only registered on the MCP
@@ -469,6 +511,8 @@ export interface LogEntry {
 
 /** What the renderer needs to know about the extension bridge, without any secrets. */
 export interface BridgeStatus {
+  /** 最近观察到的扩展协议；未知不等于兼容或不兼容。 */
+  compatible?: boolean | null;
   running: boolean;
   port: number | null;
   /** Durable authorization: true once a browser extension has been issued this app's token. */

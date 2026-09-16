@@ -472,22 +472,23 @@ describe('staged executable authority across later events', () => {
     await applyStagedUpdate();
     expect(spawned).toEqual([]);
   });
-  it('starts immediately and repeats on the unreferenced six-hour timer', async () => {
+  it('keeps automatic update polling disabled in this custom fork while preserving deliberate manual checks', async () => {
     const unref = vi.fn();
-    let repeat: (() => void) | undefined;
     const interval = vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay: number) => {
       expect(delay).toBe(6 * 60 * 60_000);
-      repeat = callback;
+      void callback;
       return { unref };
     }) as unknown as typeof setInterval);
     try {
       const { startUpdateChecks } = await import('../src/main/update.js');
       const first = github({ version: APP_VERSION });
-      startUpdateChecks(); await checkForUpdates();
-      expect(first.asked).toEqual(['latest']); expect(unref).toHaveBeenCalledOnce();
-      const next = github({ version: APP_VERSION });
-      repeat!(); await checkForUpdates();
-      expect(next.asked).toEqual(['latest']);
+      startUpdateChecks();
+      expect(first.asked).toEqual([]);
+      expect(interval).not.toHaveBeenCalled();
+      expect(unref).not.toHaveBeenCalled();
+
+      await checkForUpdates();
+      expect(first.asked).toEqual(['latest']);
     } finally { interval.mockRestore(); }
   });
 });

@@ -23,6 +23,12 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { isProModel } from '../../shared/chat-models.js';
+import {
+  executionTargetSchema,
+  LOCAL_NODE_CONFIG_VERSION,
+  LOCAL_NODE_ID,
+  type ExecutionTarget
+} from '../../shared/nodes.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type {
@@ -274,6 +280,12 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     lastTurnOutcome: null,
     activeTurnId: null,
     finishTurn: null,
+    executionTarget: {
+      nodeId: LOCAL_NODE_ID,
+      workspace: null,
+      bindingVersion: 1,
+      nodeConfigVersion: LOCAL_NODE_CONFIG_VERSION
+    },
     agents: [],
     origin: null
   };
@@ -396,14 +408,24 @@ export async function createSession(options: {
   titleSource?: SessionSummary['titleSource'];
   conversationId?: string | null;
   origin?: SessionOrigin | null;
+  projectId?: string;
+  executionTarget?: ExecutionTarget;
 }): Promise<SessionSummary> {
   const id = `${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
   const summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
   summary.origin = options.origin ?? null;
   if (options.titleSource) summary.titleSource = options.titleSource;
+  if (options.projectId) summary.projectId = options.projectId;
+  if (options.executionTarget) summary.executionTarget = executionTargetSchema.parse(options.executionTarget);
   if (options.origin?.fromSessionId) {
     const source = await getSession(options.origin.fromSessionId);
-    if (source?.projectId) summary.projectId = source.projectId;
+    if (source?.projectId) {
+      if (summary.projectId && summary.projectId !== source.projectId) throw new Error('Session origin belongs to another project');
+      summary.projectId = source.projectId;
+    }
+    if (!options.executionTarget && source?.executionTarget) {
+      summary.executionTarget = { ...source.executionTarget, bindingVersion: 1 };
+    }
   }
   // Invalidate before exposing the in-flight live entry. A cached miss must never hide a
   // session that this process has started creating, even while its first durable write awaits.
@@ -1676,6 +1698,13 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         : null;
     const { [META_HISTORY_SEQ]: _historySeq, [META_CANONICAL_PROJECTION]: canonicalProjection, [META_TOKEN_ESTIMATE]: tokenEstimate, ...publicFields } = parsed;
     const publicSummary = publicFields as SessionSummary;
+    // Missing is a legitimate legacy state and means "target unresolved". A malformed field on
+    // a newer recording is corruption, not permission to silently fall back to the local node.
+    if (Object.prototype.hasOwnProperty.call(publicSummary, 'executionTarget')) {
+      const target = executionTargetSchema.safeParse(publicSummary.executionTarget);
+      if (!target.success) return null;
+      publicSummary.executionTarget = target.data;
+    }
     if (publicSummary.titleSource !== undefined && !['fallback', 'provider', 'manual'].includes(publicSummary.titleSource)) delete publicSummary.titleSource;
     const selected = publicSummary.selectedModel;
     if (selected !== undefined && (!selected || typeof selected !== 'object' ||
@@ -2374,6 +2403,100 @@ export async function bindSessionProject(id: string, projectId: string): Promise
     await writeSummary(staged, entry.historySeq);
     entry.summary = staged;
     publishAttachmentSummary(staged);
+  });
+}
+
+/**
+ * Persist one client-owned execution binding epoch. The caller supplies node/workspace/config;
+ * this store supplies the monotonically increasing session version so A -> B -> A is still a
+ * new authority. Existing work must be fenced by the caller before invoking this primitive.
+ */
+export async function bindSessionExecutionTarget(
+  id: string,
+  target: Omit<ExecutionTarget, 'bindingVersion'>
+): Promise<ExecutionTarget> {
+  const parsed = executionTargetSchema.omit({ bindingVersion: true }).parse(target);
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'execution target', async () => {
+    const executionTarget: ExecutionTarget = {
+      ...parsed,
+      bindingVersion: (entry.summary.executionTarget?.bindingVersion ?? 0) + 1
+    };
+    const staged: SessionSummary = { ...entry.summary, executionTarget, updatedAt: Date.now() };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return executionTarget;
+  });
+}
+
+export class SessionExecutionTargetError extends Error {
+  readonly code = 'TARGET_CHANGED' as const;
+
+  constructor(detail: string) {
+    super(`TARGET_CHANGED: ${detail}`);
+    this.name = 'SessionExecutionTargetError';
+  }
+}
+
+function sameExecutionTarget(left: ExecutionTarget | undefined, right: ExecutionTarget): boolean {
+  return !!left &&
+    left.nodeId === right.nodeId &&
+    left.workspace === right.workspace &&
+    left.bindingVersion === right.bindingVersion &&
+    left.nodeConfigVersion === right.nodeConfigVersion;
+}
+
+/**
+ * Holds this session's existing mutation queue across the final target check and one execution
+ * dispatch. A target rebind uses the same queue, so it cannot land between proof of the frozen
+ * epoch and the side effect that proof authorizes.
+ *
+ * This does not choose a target and never rewrites one. It only leases the exact target already
+ * frozen into the caller's input/command authority.
+ */
+export async function withSessionExecutionTargetLease<T>(
+  id: string,
+  expected: ExecutionTarget,
+  operation: () => Promise<T>
+): Promise<T> {
+  const parsed = executionTargetSchema.parse(expected);
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'execution lease', async () => {
+    if (!sameExecutionTarget(entry.summary.executionTarget, parsed)) {
+      throw new SessionExecutionTargetError('the session target changed after this work was frozen');
+    }
+    return operation();
+  });
+}
+
+/**
+ * The first browser receipt attaches a pre-created durable session to the conversation ChatGPT
+ * assigned it. This is not Compact & Resume: no context state resets and an already-attached
+ * session can only acknowledge the same conversation, never move to another one.
+ */
+export async function attachInitialConversation(id: string, conversationId: string): Promise<boolean> {
+  if (!/^[0-9a-z-]{8,256}$/i.test(conversationId)) return false;
+  missingCurrentConversations.delete(conversationId);
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'initial conversation attach', async () => {
+    if (entry.summary.conversationId === conversationId) return true;
+    if (entry.summary.conversationId !== null) return false;
+    const target = await findSessionByConversation(conversationId, { requireUnique: true });
+    if (target && target.id !== id) return false;
+    const staged: SessionSummary = {
+      ...entry.summary,
+      conversationId,
+      chatIds: entry.summary.chatIds.includes(conversationId)
+        ? [...entry.summary.chatIds]
+        : [...entry.summary.chatIds, conversationId],
+      updatedAt: Date.now(),
+      endedAt: null
+    };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return true;
   });
 }
 

@@ -637,6 +637,23 @@
                   <div class="setting"><span class="setting-text"><b>Default sub-agent model</b><em>Confirmed in ChatGPT before a worker starts.</em></span><select id="workerModel"><option value="" disabled>No observed choices</option></select></div>
                   <div class="setting"><span class="setting-text"><b>Default sub-agent reasoning</b><em>Selected independently from the model.</em></span><select id="workerReasoning"><option value="" disabled>No observed choices</option></select></div>
                   </div>
+                <h2 class="settings-section-title">Remote nodes</h2>
+                <div class="pane remote-nodes-pane">
+                  <div class="setting">
+                    <span class="setting-text"><b>Execution computers</b><em>Configure trusted remote Desktop Commander nodes. Credentials stay in secure storage on this computer.</em></span>
+                    <button class="btn" id="remoteNodesRefresh" type="button">Refresh</button>
+                    <button class="btn" id="remoteNodeAdd" type="button">Add node</button>
+                  </div>
+                  <div id="remoteNodesList" class="remote-nodes-list" aria-live="polite"></div>
+                  <form id="remoteNodeEditor" class="remote-node-editor" hidden>
+                    <input id="remoteNodeId" type="hidden" />
+                    <label><span>Node name</span><input id="remoteNodeName" type="text" maxlength="160" autocomplete="off" required /></label>
+                    <label><span>WebSocket endpoint</span><input id="remoteNodeEndpoint" type="url" maxlength="4096" spellcheck="false" placeholder="wss://host.example/node" required /></label>
+                    <label><span>Expected machine ID</span><input id="remoteNodeMachine" type="text" maxlength="256" spellcheck="false" placeholder="Optional identity pin" /></label>
+                    <label><span>Access token</span><input id="remoteNodeToken" type="password" maxlength="16384" autocomplete="new-password" placeholder="Required for a new node; blank keeps the stored token" /></label>
+                    <div class="remote-node-editor-actions"><button class="btn btn-solid" id="remoteNodeSave" type="submit">Save node</button><button class="btn" id="remoteNodeCancel" type="button">Cancel</button></div>
+                  </form>
+                </div>
                 <h2 class="settings-section-title">Workers & recovery</h2>
                 <div class="pane">
                   <div class="setting">
@@ -877,6 +894,16 @@
                   <p id="sessionControlStatus" role="status"></p>
                 </div>
               </div>
+                    </div>
+                  </details>
+                  <details class="composer-menu node-menu" id="nodeMenu">
+                    <summary aria-label="Execution computer" title="Execution computer"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-monitor" /></svg><span id="composerNodeLabel">This computer</span></summary>
+                    <div class="composer-popover">
+                      <label>Computer<select id="composerNode" aria-label="Execution computer"></select></label>
+                      <label id="composerWorkspaceRow" hidden>Remote workspace<input id="composerWorkspace" type="text" maxlength="32768" spellcheck="false" list="composerWorkspaceRoots" placeholder="Choose an approved remote path" /></label>
+                      <datalist id="composerWorkspaceRoots"></datalist>
+                      <p id="composerNodeStatus" class="muted" role="status"></p>
+                      <button class="btn node-rebind" id="composerNodeRebind" type="button" hidden>Switch this chat</button>
                     </div>
                   </details>
                 <div class="context-meter" id="contextMeter">

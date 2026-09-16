@@ -20,6 +20,7 @@ import type { ContinuationSnapshot } from '../src/main/session/continuation.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../src/shared/user-prompt.js';
 import { nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
 import { handoffPlanNotice, resumeBootstrapText } from '../src/main/session/handoff.js';
+import { executionEnvironmentProjection } from '../src/main/session/prompt.js';
 
 vi.mock('electron', () => ({
   safeStorage: {
@@ -443,7 +444,7 @@ describe('a brief longer than the app can type', () => {
    * fresh chat acts on. Cutting the tail off would hand chat B pages of history with the
    * instructions for what to do about them deleted — and nothing in the text saying so.
    */
-  it('keeps both ends of an over-long brief, and says where the middle went', async () => {
+  it('fails closed when a legacy max-sized brief leaves no room for the exact execution projection', async () => {
     await connect();
     await record();
     const { token: continuation } = await press();
@@ -457,15 +458,9 @@ describe('a brief longer than the app can type', () => {
     const stored = await capture(continuation, huge);
     expect(stored.status).toBe(200);
     const commandId = stored.body.commandId as string;
-    const text = (await redeem(commandId, 'page-1')).body.command.text as string;
-
-    expect(text).toContain('TASK — finish the bridge rewrite.');
-    expect(text).toContain('NEXT — run the full suite.');
-    expect(text).toContain('DO NOT — rebuild or reload anything.');
-    // And the cut is in the brief where the model reading it will see it, not silent.
-    expect(text).toMatch(/left out/);
-    expect(text.length).toBeLessThan(huge.length);
-    expect(text.length).toBeLessThanOrEqual(MAX_CHATGPT_MESSAGE_CHARS);
+    const redeemed = await redeem(commandId, 'page-1');
+    expect(redeemed.status).toBe(409);
+    expect(redeemed.body).toMatchObject({ error: 'command_text_too_large' });
   });
 
   it('carries a large near-budget handoff without a hidden character-budget truncation', async () => {
@@ -474,7 +469,11 @@ describe('a brief longer than the app can type', () => {
     const { token: continuation } = await press();
     const head = 'TASK — keep all of this.\n', tail = '\nNEXT — continue exactly here.';
     const noticeBudget = handoffPlanNotice('x'.repeat(64)).length;
-    const overhead = resumeBootstrapText('', continuation).length + noticeBudget;
+    const executionProjection = await executionEnvironmentProjection({
+      nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1,
+      sessionId: 'fixture-session', inputId: 'fixture-input', machineId: 'local', agentInstanceId: 'local'
+    });
+    const overhead = resumeBootstrapText('', continuation).length + noticeBudget + 2 + executionProjection.length;
     const brief = head + 'dense operational detail '.repeat(6500).slice(0,
       MAX_CHATGPT_MESSAGE_CHARS - overhead - head.length - tail.length - 8) + tail;
 
@@ -486,7 +485,7 @@ describe('a brief longer than the app can type', () => {
     expect(text).not.toContain('[[COS_CONTEXT:');
     expect(text).not.toMatch(/middle of this brief.*left out/);
     expect(text.length).toBeLessThanOrEqual(MAX_CHATGPT_MESSAGE_CHARS);
-    expect(text.length).toBeGreaterThan(MAX_CHATGPT_MESSAGE_CHARS - noticeBudget - 100);
+    expect(text.length).toBeGreaterThan(MAX_CHATGPT_MESSAGE_CHARS - noticeBudget - executionProjection.length - 100);
   });
 });
 

@@ -5,12 +5,13 @@ import { REASONING_EFFORTS, workSequence } from '../../shared/session.js';
  */
 import { z } from 'zod';
 import { browserInputModel, type InputImage } from '../../shared/input.js';
+import { executionSnapshotSchema } from '../../shared/nodes.js';
 import type { SessionSummary } from '../../shared/session.js';
 import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
-import { getSession, findSessionByConversation, createSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, sessionDirectoryMissing } from './store.js';
+import { getSession, findSessionByConversation, createSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, sessionDirectoryMissing, attachInitialConversation, withSessionExecutionTargetLease } from './store.js';
 import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
@@ -23,6 +24,7 @@ import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
+import { freezeExecution } from '../nodes/router.js';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -44,6 +46,10 @@ export const inputArgs = z.object({
 });
 export type InputArgs = z.infer<typeof inputArgs>;
 const entrySchema = inputArgs.extend({
+  /** Frozen client-owned execution authority for this exact input. Missing only on legacy rows. */
+  executionSnapshot: executionSnapshotSchema.optional(),
+  /** Pre-created session whose first browser message has not yet acquired a conversation id. */
+  opening: z.boolean().optional(),
   /** Frozen image projection; authored attachment IDs remain the replay identity. */
   toolImages: inputArgs.shape.images,
   /** One after-turn pickup earned by confirmed silence or settled Thinking failed. */
@@ -132,6 +138,10 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
 }
 async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   if (entry.attachmentDelivery === 'tool') return false;
+  // A new chat already has a durable local session, but it has no provider conversation yet.
+  // Its first native Send retains the old fresh-chat transport rule until that receipt attaches
+  // the conversation; treating it as an ordinary existing session would make policy reject it.
+  if (entry.opening === true && !entry.conversationId) return entry.transportIntent !== 'tool';
   if (entry.mode === 'finish' && entry.sessionId && entry.afterTurn !== true) {
     const session = await getSession(entry.sessionId);
     const selection = session?.selectedModel;
@@ -347,7 +357,7 @@ async function prepare(entry: InputEntry, suffix = ''): Promise<InputEntry> {
   // delivery claim so retries cannot reconstruct a different opening message.
   const text = entry.stages !== undefined && entry.mode !== 'finish'
     ? `Original user request:\n${entry.objective || entry.text}\n\nComplete workflow:\n${[entry.text, ...entry.stages].map((stage, index) => `${index + 1}. ${stage}`).join('\n\n')}\n\nBegin the complete implementation now. Later queued messages are verification checkpoints; do not wait for them to learn or implement requirements. Carry out and verify each received checkpoint before asking for the next one with session_finish; never call it repeatedly just to collect the queue.`
-    : entry.objective && !entry.sessionId
+    : entry.objective && entry.opening === true
       ? `Original user request:\n${entry.objective}\n\nOpening instruction:\n${entry.text}\n\nFollow the complete original request, including all constraints, throughout this task.`
       : entry.text;
   const mandatoryOverhead = `${TOOL_INPUT_HEADER}\n\n${finishInstruction(getConfig().ui.finishLeadMinutes)}`;
@@ -402,7 +412,11 @@ async function target(entry: InputEntry): Promise<string | null> {
   }
   if (!entry.sessionId) return null;
   const session = await getSession(entry.sessionId);
-  if (!session?.conversationId) throw new Error('This recording has no ChatGPT conversation');
+  if (!session) throw new Error('This recording no longer exists');
+  if (!session.conversationId) {
+    if (entry.opening === true) return null;
+    throw new Error('This recording has no ChatGPT conversation');
+  }
   if (isChatBlocked(session.conversationId)) throw new Error('Unblock this conversation before sending');
   return session.conversationId;
 }
@@ -416,9 +430,17 @@ async function finishInputCurrent(entry: InputEntry): Promise<boolean> {
     session.origin?.kind !== 'worker' && session.origin?.kind !== 'helper' &&
     (entry.finishOwner.userRequested === true || automaticFinishEnabled(session.conversationId));
 }
-export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
+export function enqueueInput(
+  raw: InputArgs,
+  finishOwner?: InputEntry['finishOwner'],
+  options: { opening?: boolean; executionSnapshot?: InputEntry['executionSnapshot'] } = {}
+): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
+    // `sendDesktopInput` pre-creates new sessions and marks the first input explicitly. Keep
+    // null-session admission as a legacy/internal compatibility path for retained tests/rows;
+    // it is still an opening input and receives the same prompt/automation semantics.
+    const opening = options.opening === true || input.sessionId === null;
     if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
       throw new Error('Keep the complete plan below 12,000 characters');
     const current = await load();
@@ -427,7 +449,7 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       if (JSON.stringify(inputArgs.parse({ ...prior, mode: prior.requestedMode ?? prior.mode })) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
       return { ...prior };
     }
-    let policy = input.sessionId ? await sessionInputPolicy(input.sessionId) : null;
+    let policy = input.sessionId && !opening ? await sessionInputPolicy(input.sessionId) : null;
     const requestedMode = input.mode;
     let toolImages: InputImage[] | undefined;
     let imageOwner: { conversationId: string; turnId: string } | undefined;
@@ -454,7 +476,7 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const transportIntent = input.attachmentDelivery === 'tool' ? 'tool' as const : input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
       ? policy?.canInject ? 'tool' as const : !policy || policy.browserAllowed || policy.directTurn ? 'browser' as const : undefined : undefined;
     const directTurn = input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
-    const entry: InputEntry = { ...input, ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}), ...(transportIntent ? { transportIntent } : {}), ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+    const entry: InputEntry = { ...input, ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}), ...(transportIntent ? { transportIntent } : {}), ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), ...(opening ? { opening: true } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
       await projectWorkspace(input.projectId);
       if (input.sessionId) {
@@ -464,6 +486,17 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       }
     }
     entry.conversationId = await target(entry);
+    if (entry.sessionId && entry.purpose !== 'decision') {
+      const session = await getSession(entry.sessionId);
+      if (!session?.executionTarget) {
+        throw new Error('TARGET_CONTEXT_UNRESOLVED: this session has no durable execution target; the input was not queued');
+      }
+      const frozen = options.executionSnapshot;
+      if (frozen && (frozen.sessionId !== entry.sessionId || frozen.inputId !== entry.id)) {
+        throw new Error('TARGET_CONTEXT_UNRESOLVED: the execution snapshot does not belong to this input');
+      }
+      entry.executionSnapshot = frozen ? executionSnapshotSchema.parse(frozen) : await freezeExecution(session.executionTarget, entry.sessionId, entry.id);
+    }
     if (finishOwner && !(await finishInputCurrent(entry))) throw new Error('The automatic follow-up no longer belongs to an active turn');
     if (imageOwner) {
       policy = await sessionInputPolicy(input.sessionId!);
@@ -479,7 +512,17 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     // A finish plan belongs to an existing session now. Publish every editable
     // checkpoint atomically; no composer text or first-send receipt owns its life.
     if (entry.mode === 'finish') next = materializeStages(next, entry);
-    await commit(next);
+    if (options.executionSnapshot) {
+      const frozen = entry.executionSnapshot!;
+      const { nodeId, workspace, bindingVersion, nodeConfigVersion } = frozen;
+      await withSessionExecutionTargetLease(entry.sessionId!, { nodeId, workspace, bindingVersion, nodeConfigVersion }, async () => {
+        const live = await freezeExecution(frozen, entry.sessionId!, entry.id);
+        if (live.machineId !== frozen.machineId || live.agentInstanceId !== frozen.agentInstanceId) {
+          throw new Error('TARGET_CHANGED: the executor changed while preparing this input; the message was not queued');
+        }
+        await commit(next);
+      });
+    } else await commit(next);
     return { ...next.find(row => row.id === entry.id)! };
   });
 }
@@ -488,10 +531,14 @@ function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry
   if (!sessionId || entry.stages === undefined || entry.stagesApplied) return current;
   let next = current.map(row => row.id === entry.id ? { ...row, stagesApplied: true } : row);
   // Checkpoints inherit the current chat model, including later user selections.
-  for (const [index, text] of entry.stages.entries()) next = append(next, {
-    id: randomUUID(), sessionId, projectId: entry.projectId, text, mode: 'finish', dueAt: entry.createdAt + index,
-    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: entry.createdAt + index, conversationId: entry.conversationId
-  });
+  for (const [index, text] of entry.stages.entries()) {
+    const id = randomUUID();
+    next = append(next, {
+      id, sessionId, projectId: entry.projectId, text, mode: 'finish', dueAt: entry.createdAt + index,
+      model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: entry.createdAt + index, conversationId: entry.conversationId,
+      ...(entry.executionSnapshot ? { executionSnapshot: { ...entry.executionSnapshot, sessionId, inputId: id } } : {})
+    });
+  }
   return next;
 }
 export function listInputs(): Promise<InputEntry[]> {
@@ -939,16 +986,17 @@ export function bindBrowserInputProject(id: string, owner: string, conversationI
     if (!entry || !['browser', 'sent'].includes(entry.state) || !entry.projectId || entry.purpose === 'decision') return false;
     if (entry.conversationId && entry.conversationId !== conversationId) return false;
     if (await conversationWasSuperseded(conversationId)) return false;
-    // Fence this claim to one conversation durably before creating its session.
-    const bound = { ...entry, conversationId };
-    if (!entry.conversationId) await commit(current.map(row => row === entry ? bound : row));
     const heldSessionId = entry.sessionId ?? entry.deliveredSessionId;
-    const session = heldSessionId ? await getSession(heldSessionId) :
+    let session = heldSessionId ? await getSession(heldSessionId) :
       await findSessionByConversation(conversationId, { requireUnique: true }) ?? await createSession({ conversationId, title: userTitle(entry.text, entry.text), titleSource: 'fallback' });
+    if (heldSessionId && session?.conversationId === null) {
+      if (!await attachInitialConversation(heldSessionId, conversationId)) return false;
+      session = await getSession(heldSessionId);
+    }
     if (!session || session.conversationId !== conversationId) return false;
     await assignSessionProject(session.id, entry.projectId);
     const latest = await load();
-    await commit(latest.map(row => row.id === id ? { ...row, deliveredSessionId: session.id } : row));
+    await commit(latest.map(row => row.id === id ? { ...row, conversationId, deliveredSessionId: session.id } : row));
     return true;
   });
 }
@@ -970,8 +1018,13 @@ export function acknowledgeBrowserInput(id: string, owner: string, conversationI
     if (!entry.sessionId && entry.purpose !== 'decision' && deliveredConversation) {
       await noteChatOrigin(deliveredConversation, { kind: 'desktop', fromSessionId: null, agentId: null, task: '' });
     }
+    if (entry.sessionId && deliveredConversation) {
+      const held = await getSession(entry.sessionId);
+      if (held?.conversationId === null && !await attachInitialConversation(entry.sessionId, deliveredConversation)) return false;
+    }
     const delivered = entry.sessionId ? await getSession(entry.sessionId) : deliveredConversation
       ? await findSessionByConversation(deliveredConversation, { requireUnique: true }) : null;
+    if (entry.sessionId && deliveredConversation && delivered?.conversationId !== deliveredConversation) return false;
     if (entry.purpose === 'decision' && entry.lifetime !== 'temporary-planner' && deliveredConversation) await deliveryHooks?.bindHelper?.(deliveredConversation, entry.decisionSourceSessionId ?? null);
     const acknowledged: InputEntry = { ...entry, conversationId: deliveredConversation,
       deliveredSessionId: delivered?.id ?? null, state: entry.state === 'cancelled' ? 'cancelled' : entry.purpose === 'decision' ? 'decision' : 'sent',
@@ -980,7 +1033,7 @@ export function acknowledgeBrowserInput(id: string, owner: string, conversationI
     await transition(current, current.map((row) => row === entry ? acknowledged : row.id === entry.companionInputId ? { ...row,
       state: acknowledged.state, error: acknowledged.error, deliveredSessionId: acknowledged.deliveredSessionId,
       messageId: acknowledged.messageId, deliveredAt: acknowledged.deliveredAt } : row),
-      entry.state !== 'cancelled' && !entry.sessionId && entry.automation && deliveredConversation && entry.purpose !== 'decision' ? [acknowledged] : [], 'after-send');
+      entry.state !== 'cancelled' && entry.opening === true && entry.automation && deliveredConversation && entry.purpose !== 'decision' ? [acknowledged] : [], 'after-send');
     if (entry.completedTurnId && entry.sessionId && deliveredConversation)
       await consumeGoalReplyForInputNow(deliveredConversation, entry.sessionId, entry.completedTurnId);
     logInfo(`input ${id}: browser acknowledged after ${Math.max(0, Date.now() - entry.createdAt)} ms`);

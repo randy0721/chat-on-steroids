@@ -1952,8 +1952,55 @@ async function electronClipboard(): Promise<Pick<Electron.Clipboard, 'readText' 
     if (!clipboard) throw new Error('no clipboard');
     return clipboard;
   } catch {
+    if (process.platform === 'win32') return standaloneWindowsClipboard();
     throw new ComputerError('The clipboard is only available while the app is running.');
   }
+}
+
+/**
+ * Managed remote Windows nodes intentionally run the CoS helper in plain Node, not Electron.
+ * Keep that runtime capable of the exact same paste/clipboard actions with a fixed PowerShell
+ * STA program. User text is written only to stdin; it is never interpolated into a command line.
+ */
+function standaloneWindowsClipboard(): Pick<Electron.Clipboard, 'readText' | 'writeText'> {
+  const invoke = (mode: 'read' | 'write', text = ''): Promise<string> => new Promise((resolve, reject) => {
+    const host = findWindowsPowerShell() ?? 'powershell.exe';
+    const script = mode === 'read'
+      ? "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; [Console]::Out.Write([Windows.Forms.Clipboard]::GetText())"
+      : "[Console]::InputEncoding=[Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $v=[Console]::In.ReadToEnd(); [Windows.Forms.Clipboard]::SetText($v)";
+    const env = normalizeEnvironment(process.env);
+    ensureUsablePath(env);
+    const child = spawn(host, ['-NoProfile', '-NonInteractive', '-NoLogo', '-STA', '-Command', script], {
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: env as NodeJS.ProcessEnv
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      if (child.pid !== undefined) void terminateProcessTree(child.pid);
+      reject(new ComputerError('DESKTOP_SESSION_UNAVAILABLE: Windows clipboard helper timed out.'));
+    }, 10_000);
+    timer.unref?.();
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-2000); });
+    child.once('error', error => {
+      clearTimeout(timer);
+      reject(new ComputerError(`DESKTOP_SESSION_UNAVAILABLE: could not start Windows clipboard helper: ${error.message}`));
+    });
+    child.once('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new ComputerError(`DESKTOP_SESSION_UNAVAILABLE: Windows clipboard helper exited ${code}: ${stderr.trim() || 'unknown error'}`));
+    });
+    child.stdin.end(mode === 'write' ? text : '', 'utf8');
+  });
+  return {
+    readText: () => invoke('read'),
+    writeText: async (text: string) => { await invoke('write', text); }
+  };
 }
 
 /** Confirms the helper can run at all, so the UI can say so before ChatGPT tries. */

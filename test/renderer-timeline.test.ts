@@ -38,6 +38,7 @@ function summary(events: SessionEvent[]): SessionSummary {
     id: '2026-09-02-test0001',
     title: 'Loop under test',
     conversationId: 'chat-b',
+    executionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 },
     selectedModel: { conversationId: 'chat-b', model: 'gpt-5.6-sol', reasoningEffort: 'high', observedAt: T0 },
     chatIds: ['chat-a', 'chat-b'],
     startedAt: T0,
@@ -138,6 +139,8 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
+  w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  w.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new w.Event('close')); };
   Object.assign(globalThis, {
     window: w,
     Event: w.Event,

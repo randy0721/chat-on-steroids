@@ -99,7 +99,7 @@ describe('cross-platform product surface', () => {
     expect(defaultConfig('darwin', '21.3.0').capabilities.screen).toBe(false);
   });
 
-  it.each(['darwin', 'linux'] as const)('teaches POSIX shell semantics instead of Windows guidance on %s', (platform) => {
+  it.each(['darwin', 'linux'] as const)('describes the control host while leaving shell semantics to the bound target on %s', (platform) => {
     const instructions = serverInstructions(
       {
         roots: [],
@@ -112,20 +112,22 @@ describe('cross-platform product surface', () => {
       platform
     );
 
-    expect(instructions).toContain(platform === 'darwin' ? 'Host: macOS.' : 'Host: Linux.');
-    expect(instructions).toContain('normal POSIX shell');
-    expect(instructions).not.toMatch(/PowerShell|Get-ChildItem|Windows desktop|Native Windows paths/);
-    expect(instructions.includes('Chat On Steroids Desktop')).toBe(platform === 'darwin');
+    expect(instructions).toContain(platform === 'darwin' ? 'Control host: macOS.' : 'Control host: Linux.');
+    expect(instructions).toContain('current-turn execution projection is authoritative for target OS, shell, workspace and roots');
+    expect(instructions).toContain('On a Windows target, follow PowerShell quoting/operator rules and use Windows-native paths. On a POSIX target, use its normal zsh/bash/sh semantics.');
+    expect(instructions).toContain('Chat On Steroids Desktop');
   });
 
-  it('retains the Windows-specific shell guidance on Windows', () => {
+  it('labels a Windows control host without treating it as execution-target authority', () => {
     const instructions = serverInstructions(
       { roots: [], caps: allCapabilities(), readOnly: false, sessionTools: false, agentTools: false },
       'core',
       'win32'
     );
-    expect(instructions).toContain('Host: Windows.');
-    expect(instructions).toContain('PowerShell does not expand');
+    expect(instructions).toContain('Control host: Windows.');
+    expect(instructions).toContain('The client, not the model, selects the execution node.');
+    expect(instructions).toContain('On a Windows target, follow PowerShell quoting/operator rules');
+    expect(instructions).toContain('For Windows PowerShell targets, native programs do not expand * or ?');
     expect(instructions).toContain('Chat On Steroids Desktop');
   });
 

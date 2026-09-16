@@ -2,7 +2,8 @@
  * The one-time transaction that moves a local session from one ChatGPT chat to another.
  *
  * Compact & Resume is not "summarise, then start again somewhere else". The local session is
- * the durable identity — its recorded history, its title, its workspace, its handoffs, and
+ * the durable identity — its recorded history, its title, its workspace, its execution target,
+ * its handoffs, and
  * the swarm it may be coordinating all belong to it — and chats A and B are only two ChatGPT
  * frontends attached to it in turn. So there is exactly one state-transfer mechanism here,
  * the rebind, and the handoff brief is *model context only*: it exists so the model in chat

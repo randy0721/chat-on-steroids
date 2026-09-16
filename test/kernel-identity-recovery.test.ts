@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { beforeEach, expect, it, vi } from 'vitest';
 const fixture = vi.hoisted(() => ({ attachment: vi.fn(), record: vi.fn(), blocked: false }));
 vi.mock('../src/main/session/recorder.js', async original => ({
@@ -7,7 +8,8 @@ vi.mock('../src/main/session/recorder.js', async original => ({
   recordToolCall: fixture.record
 }));
 vi.mock('../src/main/session/store.js', async original => ({
-  ...await original<typeof import('../src/main/session/store.js')>(), conversationAttachment: fixture.attachment
+  ...await original<typeof import('../src/main/session/store.js')>(), conversationAttachment: fixture.attachment,
+  getSession: async (id: string) => ({ id, executionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 } })
 }));
 vi.mock('../src/main/session/input.js', () => ({ offerToolInput: async () => ({ messages: [], reminder: '' }), acknowledgeToolInput: async () => {}, TOOL_INPUT_HEADER: '' }));
 vi.mock('../src/main/session/blocked-chats.js', () => ({
@@ -20,6 +22,7 @@ import { dispatch, fail, failIdentity, guard, ok, resetToolClock, type ToolResul
 import { currentCall } from '../src/main/mcp/call-context.js';
 import { withInboundRequestId } from '../src/main/mcp/inbound.js';
 import { IdentityLostError } from '../src/main/agents.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { observeRequestCorrelation, requestCorrelation, resetCorrelationRegistryForTests } from '../src/main/session/correlation.js';
 
 beforeEach(() => {
@@ -27,7 +30,12 @@ beforeEach(() => {
   fixture.attachment.mockResolvedValue('current'); fixture.record.mockResolvedValue(null); fixture.blocked = false;
 });
 function prove(requestId = 'request-a', conversationId = 'chat-a', sessionId = 'session-a') {
-  return observeRequestCorrelation({ requestId, conversationId, sessionId, messageId: 'message', tool: '', observedAt: Date.now() });
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(
+    { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 }, sessionId, inputId
+  );
+  return observeRequestCorrelation({ requestId, conversationId, sessionId, inputId, executionSnapshot,
+    messageId: 'message', tool: '', observedAt: Date.now() });
 }
 const invoke = (requestId = 'request-a', run = async () => ok('result')) => dispatch('read', {}, null, requestId, 'core', run);
 const refused = (requestId = 'request-a') => dispatch('agents', {}, null, requestId, 'core', () =>

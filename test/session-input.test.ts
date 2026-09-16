@@ -29,6 +29,7 @@ vi.mock('../src/main/session/store.js', () => ({
   turnHasMcpCall: vi.fn(async () => true),
   getSession: vi.fn(async (id: string) => ({ id, conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, activeTurnId: binding.activeTurnId,
     origin: { kind: binding.origin }, lastToolCallAt: binding.lastToolCallAt,
+    executionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 },
     finishTurn: { turnId: binding.activeTurnId, released: binding.finishReleased },
     selectedModel: { conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, model: binding.model } })),
   findSessionByConversation: vi.fn(async (id: string) => binding.recorded && id === binding.conversationId ? { id: 'session-one', conversationId: id } : null)
@@ -82,8 +83,18 @@ describe('durable user input ownership', () => {
     binding.finishEnabled = false;
     const text = 'Long user request. '.repeat(2000);
     const row = await enqueueInput(input({ text }));
+    expect(row.executionSnapshot).toMatchObject({
+      sessionId,
+      inputId: row.id,
+      nodeId: 'local',
+      bindingVersion: 1,
+      nodeConfigVersion: 1,
+      machineId: 'local'
+    });
+    const frozenInstance = row.executionSnapshot?.agentInstanceId;
     resetInputForTests();
     expect((await listInputs())[0]?.text).toBe(text.trim());
+    expect((await listInputs())[0]?.executionSnapshot?.agentInstanceId).toBe(frozenInstance);
     expect(await claimBrowserInput(row.id, 'page', binding.conversationId)).toMatchObject({ text: text.trim(), deliveryText: text.trim() });
   });
   it('edits queued text beyond 16000 characters while retaining the message transport ceiling', async () => {

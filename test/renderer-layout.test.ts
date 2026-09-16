@@ -25,17 +25,20 @@ let document: Document;
 let css = '';
 let chatSource = '';
 let browserPreferencesSource = '';
+let nodesSource = '';
 
 beforeAll(async () => {
   browserPreferencesSource = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'browser-preferences.ts'), 'utf8');
-  const [html, styles, chat] = await Promise.all([
+  const [html, styles, chat, nodes] = await Promise.all([
     fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8'),
     fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'styles.css'), 'utf8'),
-    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'chat.ts'), 'utf8')
+    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'chat.ts'), 'utf8'),
+    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'nodes.ts'), 'utf8')
   ]);
   document = new JSDOM(html).window.document;
   css = styles;
   chatSource = chat;
+  nodesSource = nodes;
 });
 
 it('searches whole settings sections without empty headings, orphaned controls or lost conditional visibility', () => {
@@ -439,6 +442,13 @@ describe('the settings sheet', () => {
     const listened = /const CHAT_INPUTS[^=]*=\s*\[([^\]]*)\]/.exec(chatSource);
     expect(listened, 'CHAT_INPUTS is gone or renamed').not.toBeNull();
     for (const input of pane.querySelectorAll<HTMLInputElement>('.pane input')) {
+      // Remote-node configuration is an independent credential-bearing form. It submits through
+      // nodes.ts and must never be folded into the ordinary Settings snapshot.
+      if (input.closest('#remoteNodeEditor')) {
+        expect(nodesSource).toContain("'remoteNodeEditor').addEventListener('submit'");
+        expect(nodesSource, `#${input.id} is never read by the node editor`).toContain(`'${input.id}'`);
+        continue;
+      }
       if (input.id === 'browserOverwrite' || input.id === 'browserDurations') {
         const variable = input.id === 'browserOverwrite' ? 'overwrite' : 'durations';
         expect(browserPreferencesSource).toContain(`('${input.id}')`);

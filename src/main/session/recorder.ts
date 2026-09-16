@@ -796,7 +796,10 @@ function noteCallEvidence(
       sessionId,
       messageId: call.messageId,
       tool: call.tool,
-      observedAt
+      observedAt,
+      ...(call.userMessageId ? { userMessageId: call.userMessageId } : {}),
+      ...(call.inputId ? { inputId: call.inputId } : {}),
+      ...(call.executionSnapshot ? { executionSnapshot: call.executionSnapshot } : {})
     }))
   );
   const refusals = new Set<string>();
@@ -1710,6 +1713,12 @@ export interface PageCallEvidence {
    */
   requestId?: string | null;
   createTime?: number | null;
+  /** Exact provider user-message id whose response turn contains this connector request. */
+  userMessageId?: string | null;
+  /** Main-process enrichment only; never accepted directly from browser JSON. */
+  inputId?: string;
+  /** Frozen execution authority copied from that exact durable outbox input. */
+  executionSnapshot?: import('../../shared/nodes.js').ExecutionSnapshot;
 }
 
 /**

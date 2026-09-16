@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { bindBrowserInputProject, claimBrowserInput, enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
+import { acknowledgeBrowserInput, bindBrowserInputProject, claimBrowserInput, enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { createSession, getSession, initSessionStore, rebindSession, resetSessionStoreForTests, setSessionOrigin } from '../src/main/session/store.js';
@@ -86,6 +86,17 @@ it('binds a claimed fresh input before evidence without acknowledging delivery o
   expect(await bindBrowserInputProject(entry.id, 'document', 'conversation-two')).toBe(false);
   expect(await rebindSession(bound.deliveredSessionId!, 'conversation-one', 'conversation-replacement')).toBe(true);
   expect(await bindBrowserInputProject(entry.id, 'document', 'conversation-one')).toBe(false);
+});
+
+it('claims a pre-created opening session before ChatGPT assigns its conversation and attaches the receipt to that same session', async () => {
+  const session = await createSession({ conversationId: null, title: 'Pre-created' });
+  const entry = await enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'Open this chat', dueAt: 0, mode: 'auto', model: null, reasoningEffort: null }, undefined, { opening: true });
+  expect(entry).toMatchObject({ sessionId: session.id, opening: true, transportIntent: 'browser' });
+  expect(entry.executionSnapshot).toMatchObject({ sessionId: session.id, inputId: entry.id, nodeId: 'local' });
+  expect(await claimBrowserInput(entry.id, 'document', null)).toMatchObject({ id: entry.id, sessionId: session.id });
+  expect(await acknowledgeBrowserInput(entry.id, 'document', 'conversation-opening', 'provider-message')).toBe(true);
+  expect(await getSession(session.id)).toMatchObject({ conversationId: 'conversation-opening' });
+  expect((await listInputs()).find(row => row.id === entry.id)).toMatchObject({ deliveredSessionId: session.id, messageId: 'provider-message' });
 });
 
 it('retains project ownership through restart, resume and exact worker origins', async () => {

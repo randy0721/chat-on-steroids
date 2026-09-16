@@ -6,6 +6,8 @@
  * agree on exactly.
  */
 
+import type { ExecutionTarget } from './nodes.js';
+
 /** Where an event came from. The extension is untrusted UI observation; mcp is ours. */
 export type EventSource = 'extension' | 'mcp' | 'app';
 
@@ -450,6 +452,12 @@ export interface SessionSummary {
   selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
   /** Explicit local project; durable across frontend conversation replacement. */
   projectId?: string;
+  /**
+   * Client-owned execution binding. Its bindingVersion is the session epoch: every accepted
+   * target/workspace switch increments it, including A -> B -> A. Absent only on recordings
+   * created before node routing existed and therefore never permission to guess a target.
+   */
+  executionTarget?: ExecutionTarget;
   id: string;
   title: string;
   /**

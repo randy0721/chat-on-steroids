@@ -76,7 +76,7 @@ const {
 } = await import('../src/main/session/continuation.js');
 const { RESUME_CLAIM_WINDOW_MS, resumeOpeningChat } = await import('../src/main/session/resume-gate.js');
 const { briefShortfall, resumeBootstrapText } = await import('../src/main/session/handoff.js');
-const { createSession, getSession, initSessionStore, resetSessionStoreForTests, sessionsRoot } = await import(
+const { bindSessionExecutionTarget, createSession, getSession, initSessionStore, resetSessionStoreForTests, sessionsRoot } = await import(
   '../src/main/session/store.js'
 );
 const store = await import('../src/main/session/store.js');
@@ -144,6 +144,28 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
 }
 
 describe('capturing the brief', () => {
+  it('keeps the durable execution target unchanged across continuation restore and A to B commit', async () => {
+    const summary = await createSession({ title: 'node-bound work', conversationId: CHAT_A });
+    const target = await bindSessionExecutionTarget(summary.id, {
+      nodeId: 'office-windows',
+      workspace: 'C:\\work\\crm',
+      nodeConfigVersion: 7
+    });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+    await attachSummary(opened.token, SAMPLE_BRIEF);
+
+    const snapshot = snapshotContinuations();
+    resetContinuationsForTests();
+    await restoreContinuations(snapshot);
+    expect((await getSession(summary.id))?.executionTarget).toEqual(target);
+
+    expect(await commitContinuation(opened.token, CHAT_B)).toBe(true);
+    expect(await getSession(summary.id)).toMatchObject({
+      conversationId: CHAT_B,
+      executionTarget: target
+    });
+  });
+
   it('freezes exact source model intent across selection changes and durable restore', async () => {
     const summary = await createSession({ title: 'model transfer', conversationId: CHAT_A });
     await store.observeSessionModel(summary.id, CHAT_A, 'gpt-5.6-sol', 10, 'high');

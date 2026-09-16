@@ -1,11 +1,11 @@
 import { conversationProgress } from './session/progress.js';
 import { goalErrorMessage } from '../shared/goal-errors.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
-import { prepareSessionPrompt } from './session/prompt.js';
+import { executionEnvironmentProjection, prepareSessionPrompt } from './session/prompt.js';
 import { pendingChatModelRequest, observeChatModels, requestChatModels } from './chat-models.js';
 import { isProModel } from '../shared/chat-models.js';
 import type { SessionSummary } from '../shared/session.js';
-import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, type InputActivity } from './session/input.js';
+import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, type InputActivity, type InputEntry } from './session/input.js';
 import { pluginRefreshPublications, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import { wakeBrowserUrl } from './browser-startup.js';
@@ -38,11 +38,12 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
  * cannot read a file, run anything, or change a permission.
  */
 
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus } from '../shared/types.js';
 import { positionOf } from '../shared/chronology.js';
-import { CHAT_SILENCE_MS, CONTINUATION_MARKER, isReasoningEffort, toolCallSummary, workSequence, type ReasoningEffort, type SessionEvent, type SessionOrigin } from '../shared/session.js';
+import { CHAT_SILENCE_MS, CONTINUATION_MARKER, isReasoningEffort, originTitle, toolCallSummary, workSequence, type ReasoningEffort, type SessionEvent, type SessionOrigin } from '../shared/session.js';
+import { executionSnapshotSchema, type ExecutionSnapshot, type ExecutionTarget } from '../shared/nodes.js';
 import { isChatBlocked, chatBlockedAt } from './session/blocked-chats.js';
 export { CHAT_ACTIVE_MS, CHAT_SILENCE_MS } from '../shared/session.js';
 import { getConfig, updateConfig } from './config.js';
@@ -95,8 +96,10 @@ import {
 } from './session/recorder.js';
 import {
   autoCompactionReady,
+  attachInitialConversation,
   automaticCompactionAllowed,
   conversationWasSuperseded,
+  createSession,
   findSessionByConversation,
   getSession,
   readSessionPlan,
@@ -186,8 +189,9 @@ import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
-import { requestCorrelation } from './session/correlation.js';
+import { enrichRequestCorrelationsForInput, requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
+import { freezeExecution } from './nodes/router.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -377,9 +381,15 @@ type CommandSpec =
        * Forwarded as declared creation intent on the open URL, independently of model:
        * setting a level never selects or changes the model. The app reports the requested
        * value; only the chat's own picker state proves what ChatGPT applied.
-       */
+      */
       reasoningEffort: ReasoningEffort | null;
       runId: string;
+      /** Exact prime route that authorized this worker incarnation. */
+      primeConversationId: string;
+      /** Durable worker session created before the browser receives the bootstrap. */
+      sessionId: string;
+      /** Frozen executor instance for the bootstrap-authored provider turn. */
+      executionSnapshot: ExecutionSnapshot;
     }
   /**
    * Waking a sleeping worker in the chat it already has.
@@ -417,7 +427,7 @@ type CommandSpec =
    * move happened. Keyed by session, because compacting the same chat twice is one job whose
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
-  | { type: 'resume'; sessionId: string; token: string }
+  | { type: 'resume'; sessionId: string; token: string; executionSnapshot?: ExecutionSnapshot }
   | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string };
 
 interface Command {
@@ -453,6 +463,8 @@ interface Command {
    * Memory only: a command restored from a previous run has no page waiting for it.
    */
   owner: string | null;
+  /** The one provider workflow this worker bootstrap may authorize, once exact page evidence claims it. */
+  bootstrapRequestId?: string | null;
 }
 
 type CommandPhase = 'queued' | 'leased';
@@ -466,6 +478,20 @@ interface CommandReceipt {
   committed: boolean;
   error: string | null;
   completedAt: number;
+  /** Durable bootstrap authority retained after the live worker command is retired. */
+  workerBootstrap?: {
+    agent: string;
+    runId: string;
+    sessionId: string;
+    executionSnapshot: ExecutionSnapshot;
+    requestId: string | null;
+  };
+  /** Exact first provider user-message ownership for a Compact & Resume replacement chat. */
+  resumeBootstrap?: {
+    sessionId: string;
+    executionSnapshot: ExecutionSnapshot;
+    userMessageId: string;
+  };
 }
 
 interface DurableCommandRecord {
@@ -476,10 +502,11 @@ interface DurableCommandRecord {
   claimedAt: number | null;
   owner: string | null;
   lastError: string | null;
+  bootstrapRequestId?: string | null;
 }
 
 interface DurableCommandSnapshot {
-  version: 4;
+  version: 5;
   commands: DurableCommandRecord[];
   receipts: CommandReceipt[];
 }
@@ -545,12 +572,17 @@ let commandReceipts: CommandReceipt[] = [];
  */
 const commandRetirementsAwaitingBroker = new Map<string, Command>();
 const commandWrites = new Map<string, Promise<boolean>>();
+/** De-duplicates async worker-session/snapshot preparation for one exact broker slot. */
+const workerBootstrapPreparations = new Map<string, Promise<BridgeCommand | null>>();
+/** Preserves broker spawn order while each worker session/snapshot crosses its durable boundary. */
+let workerBootstrapPreparationTail: Promise<void> = Promise.resolve();
 /** Serializes the broker-claim + browser-lease half of one revival redeem. */
 const commandRedeems = new Map<string, Promise<void>>();
 let requestWindow = { start: Date.now(), count: 0 };
 const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
 let versionWarned = false;
+let observedExtensionProtocol: number | null = null;
 
 export function onBridgeChange(listener: () => void): () => void {
   listeners.add(listener);
@@ -569,7 +601,8 @@ export async function bridgeStatus(): Promise<BridgeStatus> {
     paired: stored !== null && stored !== BROWSER_DISCONNECTED,
     present: browserPresent(),
     lastSeenAt,
-    extensionVersion
+    extensionVersion,
+    compatible: observedExtensionProtocol === null ? null : observedExtensionProtocol === BRIDGE_PROTOCOL
   };
 }
 
@@ -697,13 +730,19 @@ function protocolCompatible(req: http.IncomingMessage): boolean {
 function noteExtensionVersion(req: http.IncomingMessage): void {
   const version = req.headers['x-extension-version'];
   const protocol = extensionProtocol(req);
+  let didChange = false;
+  if (protocol !== null && protocol !== observedExtensionProtocol) {
+    observedExtensionProtocol = protocol;
+    didChange = true;
+  }
   if (typeof version === 'string' && version !== extensionVersion) {
     extensionVersion = version.slice(0, 32);
     logInfo(`bridge: browser extension ${extensionVersion} connected`);
     // Even an incompatible peer reports its version before the protocol fence.
     // Publish that evidence without falsely granting compatible browser presence.
-    changed();
+    didChange = true;
   }
+  if (didChange) changed();
   if (!versionWarned && protocol !== null && protocol !== BRIDGE_PROTOCOL) {
     versionWarned = true;
     logWarn(
@@ -851,10 +890,131 @@ function parseCallEvidence(input: unknown, untooled = false): PageCallEvidence[]
           ? item['requestId']
           : null,
       createTime:
-        typeof item['createTime'] === 'number' && Number.isFinite(item['createTime']) ? item['createTime'] : null
+        typeof item['createTime'] === 'number' && Number.isFinite(item['createTime']) ? item['createTime'] : null,
+      userMessageId:
+        typeof item['userMessageId'] === 'string' && item['userMessageId'].length > 0 && item['userMessageId'].length <= 256
+          ? item['userMessageId']
+          : null
     });
   }
   return out.filter((call) => !duplicated.has(call.messageId));
+}
+
+/**
+ * Adds execution authority only from the exact durable outbox receipt named by the provider
+ * user-message id. Browser JSON can report that opaque id, but cannot supply an input id,
+ * session target or execution snapshot itself.
+ */
+async function enrichCallExecutionEvidence(
+  ownerConversationId: string,
+  calls: readonly PageCallEvidence[]
+): Promise<PageCallEvidence[]> {
+  if (!calls.some((call) => call.userMessageId)) return [...calls];
+  const rows = await listInputs();
+  return calls.map((call) => {
+    if (!call.userMessageId) return call;
+    const row = executionReceiptForProviderMessage(rows, ownerConversationId, call.userMessageId);
+    if (row) {
+      return {
+        ...call,
+        inputId: row.id,
+        executionSnapshot: row.executionSnapshot
+      };
+    }
+    const resume = resumeExecutionReceipt(ownerConversationId, call.userMessageId);
+    return resume ? {
+      ...call,
+      inputId: resume.inputId,
+      executionSnapshot: { ...resume }
+    } : call;
+  });
+}
+
+/** Exact provider-message proof retained by the durable Compact & Resume command receipt. */
+function resumeExecutionReceipt(ownerConversationId: string, userMessageId: string): ExecutionSnapshot | null {
+  const matches = commandReceipts.filter(receipt =>
+    receipt.committed &&
+    receipt.conversationId === ownerConversationId &&
+    receipt.resumeBootstrap?.userMessageId === userMessageId &&
+    receipt.resumeBootstrap.executionSnapshot.inputId === receipt.id &&
+    receipt.resumeBootstrap.executionSnapshot.sessionId === receipt.resumeBootstrap.sessionId
+  );
+  return matches.length === 1 ? { ...matches[0]!.resumeBootstrap!.executionSnapshot } : null;
+}
+
+function sameExecutionAuthority(a: NonNullable<InputEntry['executionSnapshot']>, b: NonNullable<InputEntry['executionSnapshot']>): boolean {
+  return a.sessionId === b.sessionId &&
+    a.nodeId === b.nodeId &&
+    a.workspace === b.workspace &&
+    a.bindingVersion === b.bindingVersion &&
+    a.nodeConfigVersion === b.nodeConfigVersion &&
+    a.machineId === b.machineId &&
+    a.agentInstanceId === b.agentInstanceId;
+}
+
+/**
+ * Resolves one provider user-message receipt back to the durable input that owns execution.
+ * A combined browser send legitimately gives its root and queued companion the same provider
+ * message id. That case is accepted only when the pair relationship is exact and both frozen
+ * snapshots name the same execution authority; the root remains the request's input identity.
+ * Any other duplicate is ambiguous and deliberately returns null.
+ */
+function executionReceiptForProviderMessage(
+  rows: readonly InputEntry[],
+  ownerConversationId: string,
+  userMessageId: string
+): InputEntry | null {
+  const matches = rows.filter((row) =>
+    row.messageId === userMessageId &&
+    row.conversationId === ownerConversationId &&
+    row.executionSnapshot?.inputId === row.id &&
+    row.executionSnapshot.sessionId === (row.sessionId ?? row.deliveredSessionId)
+  );
+  if (matches.length === 1) return matches[0]!;
+  if (matches.length !== 2) return null;
+  const roots = matches.filter((row) => row.companionInputId && matches.some((other) => other.id === row.companionInputId));
+  if (roots.length !== 1) return null;
+  const root = roots[0]!;
+  const companion = matches.find((row) => row.id === root.companionInputId);
+  if (!root.executionSnapshot || !companion?.executionSnapshot) return null;
+  return sameExecutionAuthority(root.executionSnapshot, companion.executionSnapshot) ? root : null;
+}
+
+/**
+ * A desktop-authored first message already owns a durable null-conversation session before the
+ * browser is allowed to send it. Until the exact native Send ACK attaches the provider
+ * conversation, a page-side observation cannot prove which unbound opening it belongs to.
+ * Refuse that first-observation race rather than letting recorder create a second session that
+ * would permanently steal request ownership from the authored input's frozen target.
+ */
+async function unboundOpeningMayOwnNewConversation(conversationId: string): Promise<boolean> {
+  if (await findSessionByConversation(conversationId, { requireUnique: true })) return false;
+  const inputOpening = (await listInputs()).some((row) =>
+    row.opening === true &&
+    row.purpose !== 'decision' &&
+    row.conversationId === null &&
+    row.deliveredAt === undefined &&
+    (row.state === 'browser' || row.state === 'cancelled') &&
+    !!row.sessionId &&
+    row.executionSnapshot?.sessionId === row.sessionId &&
+    row.executionSnapshot.inputId === row.id
+  );
+  if (inputOpening) return true;
+  // Worker bootstraps use the same ownership rule as desktop opening inputs, but their durable
+  // outbox is the bridge command itself. Until an exact ACK or exact (agent, command-id) event
+  // attaches its pre-created session, a page-side conversation id cannot decide which opening it
+  // is. Holding generic /correlations and /events at 409 prevents recorder from creating a shadow
+  // session that would permanently separate the request from its frozen worker execution target.
+  for (const command of commands) {
+    if (command.spec.type !== 'worker') continue;
+    const session = await getSession(command.spec.sessionId);
+    if (
+      session?.conversationId === null &&
+      command.spec.executionSnapshot.sessionId === command.spec.sessionId &&
+      command.spec.executionSnapshot.inputId === command.id
+    ) return true;
+  }
+  return false;
 }
 
 /**
@@ -1608,7 +1768,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         await registerGoalDecisionChat(helperConversation, entry.decisionSourceSessionId);
       }
       if (route === '/input/answer') return json(res, 200, { ok: typeof body.response === 'string' && await completeBrowserDecision(body.id, body.owner, body.response, deliveredConversation) }, origin);
-      const acknowledged = await acknowledgeBrowserInput(body.id, body.owner, deliveredConversation, typeof body.messageId === 'string' ? body.messageId : undefined);
+      const deliveredMessageId = typeof body.messageId === 'string' ? body.messageId : undefined;
+      const acknowledged = await acknowledgeBrowserInput(body.id, body.owner, deliveredConversation, deliveredMessageId);
+      if (acknowledged && deliveredConversation && deliveredMessageId) {
+        const delivered = executionReceiptForProviderMessage(await listInputs(), deliveredConversation, deliveredMessageId);
+        if (delivered?.executionSnapshot) {
+          enrichRequestCorrelationsForInput({
+            conversationId: deliveredConversation,
+            userMessageId: deliveredMessageId,
+            inputId: delivered.id,
+            executionSnapshot: delivered.executionSnapshot
+          });
+        }
+      }
       if (acknowledged && deliveredConversation) await collectRecordedBrowserDecision(deliveredConversation);
       return json(res, 200, { ok: acknowledged }, origin);
     }
@@ -1654,7 +1826,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
-    const calls = parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null);
+    if (await unboundOpeningMayOwnNewConversation(id)) {
+      return json(res, 409, { error: 'opening_session_pending' }, origin);
+    }
+    const calls = await enrichCallExecutionEvidence(
+      id,
+      parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null)
+    );
     if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
 
     // This is the live-turn ownership handshake, deliberately separate from transcript
@@ -1682,9 +1860,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return held !== null && held.conversationId !== id;
     });
     const blocked = new Set(conflicts);
-    const unresolved = calls.filter((call) => call.requestId && !blocked.has(call.requestId) && requestCorrelation(call.requestId) === null);
-    const observations: ChatObservation[] = unresolved.length > 0
-      ? [{ kind: 'tool_evidence', time: Date.now(), calls: unresolved }]
+    const evidenceToStore = calls.filter((call) => {
+      if (!call.requestId || blocked.has(call.requestId)) return false;
+      const held = requestCorrelation(call.requestId);
+      return held === null || (
+        held.conversationId === id &&
+        ((!held.userMessageId && !!call.userMessageId) ||
+          (!held.executionSnapshot && !!call.executionSnapshot))
+      );
+    });
+    const observations: ChatObservation[] = evidenceToStore.length > 0
+      ? [{ kind: 'tool_evidence', time: Date.now(), calls: evidenceToStore }]
       : [];
     // Even an already-confirmed mapping must ensure/reuse the chat session, matching /events'
     // first-observation semantics and making this one atomic operation from the page's view.
@@ -1720,6 +1906,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       ? body['agent']
       : null;
     const reportedCommandId = typeof body['agentCommandId'] === 'string' ? body['agentCommandId'] : null;
+    let bootstrapAuthority = reportedAgent && reportedCommandId
+      ? workerBootstrapAuthority(reportedAgent, reportedCommandId, id)
+      : null;
     if (reportedAgent && reportedCommandId) {
       const pending = commands.find(
         (command) =>
@@ -1729,7 +1918,25 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           swarmRunning(command.spec.runId) &&
           command.claimedAt !== null
       );
-      if (pending?.spec.type === 'worker') bindConversation(reportedAgent, id, pending.spec.runId);
+      if (pending?.spec.type === 'worker') {
+        let attached = false;
+        try {
+          attached = await attachInitialConversation(pending.spec.sessionId, id);
+        } catch (error) {
+          logWarn(`bridge: lost-ACK worker session attach for ${pending.spec.agent} is not durable yet — ${error instanceof Error ? error.message : String(error)}`);
+          return json(res, 503, { error: 'worker_session_attach_not_durable', retryable: true }, origin);
+        }
+        if (!attached) return json(res, 409, { error: 'worker_session_identity_changed' }, origin);
+        const boundNow = bindConversation(reportedAgent, id, pending.spec.runId);
+        if (boundNow) bindAgentWorkspace(reportedAgent, id, pending.spec.runId);
+        bootstrapAuthority = workerBootstrapAuthority(reportedAgent, reportedCommandId, id);
+      }
+    }
+    if (await unboundOpeningMayOwnNewConversation(id)) {
+      // 409 is intentionally retryable by the extension journal. Exact worker-command evidence
+      // above gets the same chance as a native Send ACK to attach its pre-created session; a
+      // generic page batch cannot choose among unbound openings.
+      return json(res, 409, { error: 'opening_session_pending' }, origin);
     }
     // The page reporting for a conversation is the other half of first-hand liveness, and
     // the reason a worker whose tab is open is never on the silence clock at all. It also
@@ -1737,6 +1944,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const revived = noteAgentAlive(id, 'page');
     if (revived?.report) await recordAgentMessage(revived.report, 'sent', id);
     const observations = parseObservations(body['events']);
+    for (const observation of observations) {
+      if (observation.kind === 'tool_evidence' && observation.calls?.length) {
+        observation.calls = await enrichCallExecutionEvidence(id, observation.calls);
+      }
+    }
+    await enrichWorkerBootstrapCalls(bootstrapAuthority, observations);
     // A turn beginning is the one page fact that outranks the app's own idea of this worker's
     // state. Reported here rather than inferred from `generating`, because this is the exact
     // moment the model started running and the only one that can outvote a sleep decision made
@@ -2070,8 +2283,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } else if (summary?.conversationId === id && summary.origin?.kind === 'worker' && summary.origin.agentId && openingUserMessage?.messageId) {
       const original = openingUserMessage.message.text.trimStart();
       const authored = userPromptText(original) ?? original;
-      const expected = bootstrapText({ type: 'worker', agent: summary.origin.agentId, task: summary.origin.task,
-        model: null, reasoningEffort: null, runId: '' }, '');
+      const expected = workerBootstrapText(summary.origin.agentId, summary.origin.task);
       if (!openingUserMessage.message.truncated && authored === expected) bootstrapMessageId = openingUserMessage.messageId;
     }
     // Where this conversation begins inside a session that has been compacted and resumed.
@@ -3391,6 +3603,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           return !!result;
         });
         if (!claimed) return json(res, 409, { error: 'continuation_not_claimable' }, origin);
+        // The continuation token owns the destination chat, but not an executor process. Freeze
+        // the first replacement turn now, before returning any bootstrap text to the browser.
+        // A transiently unavailable remote node therefore yields no Send side effect and may be
+        // retried with this same command; it is never replaced by the control host.
+        try {
+          await ensureResumeExecutionSnapshot(command);
+        } catch (error) {
+          logWarn(`bridge: resume execution target is not ready for ${command.spec.sessionId} — ${error instanceof Error ? error.message : String(error)}`);
+          return json(res, 503, { error: 'resume_execution_target_unavailable', retryable: true }, origin);
+        }
         // Replace the short page-open timer with the continuation's existing outer lifetime.
         armDeadline(command);
       } catch (err) {
@@ -3402,10 +3624,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (described.text && command.spec.type === 'worker') {
       // A newly spawned worker gets setup once. Revival and Compact & Resume
       // carry their own continuation text without repeating executor setup.
-      const sourceConversation = primeConversation(command.spec.runId);
-      const source = sourceConversation ? await findSessionByConversation(sourceConversation, { requireUnique: true }) : null;
-      const sessionId = source?.conversationId === sourceConversation ? source?.id : undefined;
-      described.text = await prepareSessionPrompt(described.text, { sessionId });
+      // The worker's pre-created local session already inherited the exact prime project/target.
+      // Scope the prompt to that session too, so bootstrap setup cannot drift with a later prime
+      // selection while this browser command is waiting to be redeemed.
+      described.text = await prepareSessionPrompt(described.text, {
+        sessionId: command.spec.sessionId,
+        executionSnapshot: command.spec.executionSnapshot
+      });
+    }
+    if (described.text && command.spec.type === 'resume' && command.spec.executionSnapshot) {
+      described.text = `${described.text}\n\n${await executionEnvironmentProjection(command.spec.executionSnapshot)}`;
     }
     if (!commands.includes(command) || command.owner !== client) return json(res, 409, { error: 'command_taken' }, origin);
     const liveResume = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
@@ -3430,6 +3658,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const status: AckStatus = raw === 'failed' ? 'failed' : 'sent';
     const error = typeof body['error'] === 'string' ? body['error'].slice(0, 200) : null;
     const client = typeof body['client'] === 'string' ? body['client'].slice(0, 64) : '';
+    const bootstrapUserMessageId = typeof body['userMessageId'] === 'string' && body['userMessageId'].length > 0 && body['userMessageId'].length <= 256
+      ? body['userMessageId'] : null;
     const conversation = conversationId(body['conversationId']);
     const priorReceipt = receiptFor(id);
     if (priorReceipt) {
@@ -3482,7 +3712,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // The one moment at which the queued command and the conversation it became are
     // both in hand, and so the only chance to name that chat after the work rather
     // than after the bootstrap prompt about to be typed into it.
-    const opened = status === 'sent' ? await commandOrigin(id) : null;
+    // Worker sessions already carry their durable origin before the browser sees the bootstrap.
+    // Re-stamping it from an ACK would recreate a second, page-owned initialization path.
+    const opened = status === 'sent' && ownedCommand.spec.type !== 'worker' ? await commandOrigin(id) : null;
     if (conversation && opened) {
       await noteChatOrigin(conversation, opened).catch((err: Error) =>
         logWarn(`could not record the origin of a fresh chat: ${err.message}`)
@@ -3606,7 +3838,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             outcome: 'committed',
             committed: true,
             error: null,
-            completedAt: Date.now()
+            completedAt: Date.now(),
+            ...(command.spec.executionSnapshot && bootstrapUserMessageId ? {
+              resumeBootstrap: {
+                sessionId: command.spec.sessionId,
+                executionSnapshot: { ...command.spec.executionSnapshot },
+                userMessageId: bootstrapUserMessageId
+              }
+            } : {})
           };
         }
       } else {
@@ -3644,40 +3883,61 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             completedAt: Date.now()
           };
         } else {
-        // This is where a worker starts. Do it only after the post-await command ownership
-        // revalidation above; a page cancelled while noteChatOrigin ran must never bind a slot.
-        if (agent && /^[a-z0-9-]{1,40}$/i.test(agent)) {
-          const boundNow = bindConversation(agent, conversation, command.spec.runId);
-          // The worker inherited a workspace before its chat existed, under the reusable
-          // friendly id `agent:worker-N`. The browser binding is the first authoritative moment
-          // that exact ChatGPT conversation is known, so migrate the staging key now even if the
-          // worker never makes a local tool call before it finishes/sleeps.
-          if (boundNow) bindAgentWorkspace(agent, conversation, command.spec.runId);
-        }
-        const bound = agent ? agentConversation(agent, command.spec.runId) === conversation : false;
-        if (!bound) {
-          const why = 'the chat this app opened for the worker could not be bound to that slot';
-          if (agent) failAgent(agent, why, undefined, {}, command.spec.runId);
-          receipt = {
-            id,
-            client: client || command.owner,
-            conversationId: conversation,
-            outcome: 'terminal-failure',
-            committed: false,
-            error: why,
-            completedAt: Date.now()
-          };
-        } else {
-          receipt = {
-            id,
-            client: client || command.owner,
-            conversationId: conversation,
-            outcome: 'committed',
-            committed: true,
-            error: null,
-            completedAt: Date.now()
-          };
-        }
+          // This is where a worker starts. Its durable session/snapshot existed before browser
+          // delivery; the ACK may only attach that exact session to the provider conversation.
+          // It is never allowed to create a replacement session or re-read a current target.
+          let attached = false;
+          try {
+            attached = await attachInitialConversation(command.spec.sessionId, conversation);
+          } catch (attachError) {
+            logWarn(`bridge: worker session attach for ${command.spec.agent} is not durable yet — ${attachError instanceof Error ? attachError.message : String(attachError)}`);
+            return json(res, 503, { error: 'worker_session_attach_not_durable', retryable: true }, origin);
+          }
+          if (!attached) {
+            const why = 'the chat this app opened for the worker did not match its pre-created session';
+            if (agent) failAgent(agent, why, undefined, {}, command.spec.runId);
+            receipt = {
+              id,
+              client: client || command.owner,
+              conversationId: conversation,
+              outcome: 'terminal-failure',
+              committed: false,
+              error: why,
+              completedAt: Date.now()
+            };
+          } else {
+            if (agent && /^[a-z0-9-]{1,40}$/i.test(agent)) {
+              const boundNow = bindConversation(agent, conversation, command.spec.runId);
+              // The worker inherited a workspace before its chat existed, under the reusable
+              // friendly id `agent:worker-N`. The exact conversation is now known, so migrate it.
+              if (boundNow) bindAgentWorkspace(agent, conversation, command.spec.runId);
+            }
+            const bound = agent ? agentConversation(agent, command.spec.runId) === conversation : false;
+            if (!bound) {
+              const why = 'the chat this app opened for the worker could not be bound to that slot';
+              if (agent) failAgent(agent, why, undefined, {}, command.spec.runId);
+              receipt = {
+                id,
+                client: client || command.owner,
+                conversationId: conversation,
+                outcome: 'terminal-failure',
+                committed: false,
+                error: why,
+                completedAt: Date.now()
+              };
+            } else {
+              receipt = {
+                id,
+                client: client || command.owner,
+                conversationId: conversation,
+                outcome: 'committed',
+                committed: true,
+                error: null,
+                completedAt: Date.now(),
+                workerBootstrap: workerBootstrapReceipt(command)
+              };
+            }
+          }
         }
       }
     } else if (command.spec.type === 'resume') {
@@ -4166,7 +4426,17 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       rearmRetainedCommandDeadlines();
       dropSpawnRequestListener?.();
       dropSpawnRequestListener = onSpawnRequest((workers) => {
-        for (const worker of workers) queueWorkerBootstrap(worker.id, worker.task, worker.model, worker.reasoningEffort, worker.runId);
+        for (const worker of workers) {
+          void queueWorkerBootstrap(
+            worker.id,
+            worker.task,
+            worker.model,
+            worker.reasoningEffort,
+            worker.runId,
+            worker.primeConversationId,
+            worker.executionTarget
+          );
+        }
       });
       // The same replay contract for waking a worker that already has a chat. A run restored
       // from disk can hold a worker left in `waking` by a crash mid-revival; registering here
@@ -4327,7 +4597,8 @@ function durableCommand(command: Command): DurableCommandRecord {
     phase: commandPhase(command),
     claimedAt: command.claimedAt,
     owner: command.owner,
-    lastError: command.lastError
+    lastError: command.lastError,
+    ...(command.bootstrapRequestId ? { bootstrapRequestId: command.bootstrapRequestId } : {})
   };
 }
 
@@ -4359,7 +4630,7 @@ function commandSnapshot(options: {
     receipts = [...receipts.filter((receipt) => receipt.id !== addReceipt.id), addReceipt];
   }
   receipts = receipts.slice(-MAX_COMMAND_RECEIPTS);
-  return { version: 4, commands: records, receipts };
+  return { version: 5, commands: records, receipts };
 }
 
 function persistCommands(): void {
@@ -4415,6 +4686,160 @@ async function persistCommandLease(
     command.owner = owner;
     return true;
   });
+}
+
+interface WorkerBootstrapAuthority {
+  agent: string;
+  runId: string;
+  sessionId: string;
+  executionSnapshot: ExecutionSnapshot;
+  requestId: string | null;
+  command: Command | null;
+  receipt: CommandReceipt | null;
+}
+
+function workerBootstrapReceipt(command: Command): CommandReceipt['workerBootstrap'] | undefined {
+  if (command.spec.type !== 'worker') return undefined;
+  return {
+    agent: command.spec.agent,
+    runId: command.spec.runId,
+    sessionId: command.spec.sessionId,
+    executionSnapshot: { ...command.spec.executionSnapshot },
+    requestId: command.bootstrapRequestId ?? null
+  };
+}
+
+/** Exact command/receipt proof for one worker opening. Friendly agent names alone never qualify. */
+function workerBootstrapAuthority(
+  agent: string,
+  commandId: string,
+  conversationId?: string | null
+): WorkerBootstrapAuthority | null {
+  const command = commands.find((entry) => entry.id === commandId) ?? null;
+  if (
+    command?.spec.type === 'worker' &&
+    command.spec.agent === agent &&
+    command.claimedAt !== null &&
+    swarmRunning(command.spec.runId)
+  ) {
+    return {
+      agent,
+      runId: command.spec.runId,
+      sessionId: command.spec.sessionId,
+      executionSnapshot: { ...command.spec.executionSnapshot },
+      requestId: command.bootstrapRequestId ?? null,
+      command,
+      receipt: null
+    };
+  }
+  const receipt = receiptFor(commandId);
+  const proof = receipt?.workerBootstrap;
+  if (
+    !receipt?.committed ||
+    !proof ||
+    proof.agent !== agent ||
+    (conversationId && receipt.conversationId !== conversationId)
+  ) return null;
+  return {
+    agent: proof.agent,
+    runId: proof.runId,
+    sessionId: proof.sessionId,
+    executionSnapshot: { ...proof.executionSnapshot },
+    requestId: proof.requestId,
+    command: null,
+    receipt
+  };
+}
+
+/**
+ * Claims the single provider workflow authored by a worker bootstrap.
+ *
+ * The command id is a UUID and is also the ExecutionSnapshot input identity. The browser keeps
+ * reporting that command id for the lifetime of the worker chat, so the id alone must never
+ * authorize later turns. The first exact `/events` batch that contains one unambiguous request id
+ * claims it durably; afterwards only that same request id may receive the frozen snapshot.
+ */
+async function claimWorkerBootstrapRequest(
+  authority: WorkerBootstrapAuthority,
+  requestId: string
+): Promise<boolean> {
+  if (authority.requestId) return authority.requestId === requestId;
+  if (authority.command) {
+    const command = authority.command;
+    return writeCommandTransition(command, async () => {
+      if (!commands.includes(command) || command.spec.type !== 'worker') return false;
+      if (command.bootstrapRequestId) return command.bootstrapRequestId === requestId;
+      const record: DurableCommandRecord = { ...durableCommand(command), bootstrapRequestId: requestId };
+      try {
+        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+      } catch (error) {
+        persistCommands();
+        logWarn(`bridge: could not persist bootstrap request claim for ${specKey(command.spec)} — ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+      if (!commands.includes(command)) return false;
+      command.bootstrapRequestId = requestId;
+      authority.requestId = requestId;
+      return true;
+    });
+  }
+
+  const original = authority.receipt;
+  if (!original) return false;
+  if (commandWrites.size > 0) {
+    await Promise.allSettled([...commandWrites.values()]);
+    const refreshed = workerBootstrapAuthority(authority.agent, original.id, original.conversationId);
+    return refreshed ? claimWorkerBootstrapRequest(refreshed, requestId) : false;
+  }
+  let resolveWrite!: (value: boolean) => void;
+  const write = new Promise<boolean>((resolve) => { resolveWrite = resolve; });
+  commandWrites.set(original.id, write);
+  try {
+    const current = receiptFor(original.id);
+    const proof = current?.workerBootstrap;
+    if (!current?.committed || !proof) return false;
+    if (proof.requestId) return proof.requestId === requestId;
+    const updated: CommandReceipt = {
+      ...current,
+      workerBootstrap: { ...proof, executionSnapshot: { ...proof.executionSnapshot }, requestId }
+    };
+    try {
+      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ addReceipt: updated }));
+    } catch (error) {
+      persistCommands();
+      logWarn(`bridge: could not persist bootstrap request claim for receipt ${original.id} — ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    commandReceipts = [...commandReceipts.filter((entry) => entry.id !== updated.id), updated].slice(-MAX_COMMAND_RECEIPTS);
+    authority.requestId = requestId;
+    authority.receipt = updated;
+    return true;
+  } finally {
+    resolveWrite(true);
+    if (commandWrites.get(original.id) === write) commandWrites.delete(original.id);
+  }
+}
+
+async function enrichWorkerBootstrapCalls(
+  authority: WorkerBootstrapAuthority | null,
+  observations: ChatObservation[]
+): Promise<void> {
+  if (!authority) return;
+  const requestIds = [...new Set(observations.flatMap((item) =>
+    item.kind === 'tool_evidence' && item.calls
+      ? item.calls.map((call) => call.requestId).filter((value): value is string => Boolean(value))
+      : []
+  ))];
+  const requestId = authority.requestId ?? (requestIds.length === 1 ? requestIds[0]! : null);
+  if (!requestId || !(await claimWorkerBootstrapRequest(authority, requestId))) return;
+  for (const item of observations) {
+    if (item.kind !== 'tool_evidence' || !item.calls) continue;
+    for (const call of item.calls) {
+      if (call.requestId !== requestId) continue;
+      call.inputId = authority.executionSnapshot.inputId;
+      call.executionSnapshot = { ...authority.executionSnapshot };
+    }
+  }
 }
 
 type RevivalRedeemResult = 'ok' | 'stale' | 'taken' | 'broker-not-durable' | 'lease-not-durable';
@@ -4536,7 +4961,7 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
   });
 }
 
-function queue(spec: CommandSpec): Command {
+function queue(spec: CommandSpec, id = randomBytes(8).toString('hex')): Command {
   const key = specKey(spec);
   const existing = commands.find((command) => specKey(command.spec) === key);
   if (existing) {
@@ -4567,13 +4992,14 @@ function queue(spec: CommandSpec): Command {
     return existing;
   }
   const command: Command = {
-    id: randomBytes(8).toString('hex'),
+    id,
     spec,
     createdAt: Date.now(),
     claimedAt: null,
     timer: null,
     lastError: null,
-    owner: null
+    owner: null,
+    bootstrapRequestId: null
   };
   commands.push(command);
   if (commands.length > MAX_COMMANDS) {
@@ -4809,17 +5235,99 @@ async function cancelAutomaticResumesNow(sessionId?: string): Promise<number> {
  * stored: the chat this opens is bound to the slot by the extension's report, and the
  * recovery key exists only if the user asks the app for one after that has failed.
  */
-export function queueWorkerBootstrap(agent: string, task: string, model: string | null, reasoningEffort: ReasoningEffort | null, runId: string): BridgeCommand | null {
+export function queueWorkerBootstrap(
+  agent: string,
+  task: string,
+  model: string | null,
+  reasoningEffort: ReasoningEffort | null,
+  runId: string,
+  primeConversationId: string,
+  spawnExecutionTarget: ExecutionTarget | null = null
+): Promise<BridgeCommand | null> {
   // A worker bootstrap is authority for one concrete broker incarnation. There is no safe
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
-  if (!runId || !swarmRunning(runId)) return null;
-  const command = queue({ type: 'worker', agent, task, model, reasoningEffort, runId });
-  // Start the clock at broker admission, exactly as a revival does. A bootstrap that never
-  // reaches a page is the case that has no other clock at all.
-  armDeadline(command);
-  deliver();
-  return describe(command, null);
+  if (!runId || !swarmRunning(runId) || primeConversation(runId) !== primeConversationId) return Promise.resolve(null);
+  const key = `worker:${runId}:${agent}`;
+  const existing = commands.find((command) => specKey(command.spec) === key);
+  if (existing) return Promise.resolve(describe(existing, null));
+  const inFlight = workerBootstrapPreparations.get(key);
+  if (inFlight) return inFlight;
+
+  const preparation = workerBootstrapPreparationTail.then(async (): Promise<BridgeCommand | null> => {
+    try {
+      // The broker captured this target from the exact spawning MCP call before publishing the
+      // worker invitation. A legacy/restored invitation that lacks it is unresolved: reading the
+      // prime session now would let a later rebind silently retarget work that was already accepted.
+      const prime = await findSessionByConversation(primeConversationId, { requireUnique: true });
+      const inheritedTarget = spawnExecutionTarget
+        ? { ...spawnExecutionTarget }
+        : null;
+      if (!inheritedTarget) {
+        throw new Error('TARGET_CONTEXT_UNRESOLVED: the worker invitation has no exact spawn-time execution target; the worker was not opened');
+      }
+      if (!swarmRunning(runId) || primeConversation(runId) !== primeConversationId) return null;
+
+      const origin: SessionOrigin = {
+        kind: 'worker',
+        fromSessionId: prime?.conversationId === primeConversationId ? prime.id : null,
+        agentId: agent,
+        task
+      };
+      const session = await createSession({
+        conversationId: null,
+        origin,
+        title: originTitle(origin, prime?.conversationId === primeConversationId ? prime.title : null),
+        titleSource: 'fallback',
+        executionTarget: inheritedTarget
+      });
+      if (!session.executionTarget) {
+        throw new Error('TARGET_CONTEXT_UNRESOLVED: the worker session did not inherit an execution target; the worker was not opened');
+      }
+      const commandId = randomUUID();
+      const executionSnapshot = await freezeExecution(session.executionTarget, session.id, commandId);
+      if (!swarmRunning(runId) || primeConversation(runId) !== primeConversationId) return null;
+
+      // A replay can arrive while the durable session/snapshot preparation above was awaiting
+      // disk or a remote runtime read. Re-check the exact slot before publishing this command;
+      // the already-published command owns the opening if one appeared meanwhile.
+      const carried = commands.find((command) => specKey(command.spec) === key);
+      if (carried) return describe(carried, null);
+      const command = queue({
+        type: 'worker',
+        agent,
+        task,
+        model,
+        reasoningEffort,
+        runId,
+        primeConversationId,
+        sessionId: session.id,
+        executionSnapshot
+      }, commandId);
+      // Start the clock at broker admission, exactly as a revival does. A bootstrap that never
+      // reaches a page is the case that has no other clock at all.
+      armDeadline(command);
+      deliver();
+      return describe(command, null);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failAgent(agent, reason, undefined, {}, runId);
+      try {
+        await persistCriticalSwarmNow();
+      } catch (persistError) {
+        logWarn(`bridge: worker bootstrap failure for ${agent} is not durable yet — ${persistError instanceof Error ? persistError.message : String(persistError)}`);
+      }
+      releaseQuiescentRun();
+      logWarn(`bridge: refused ${key} before browser delivery — ${reason}`);
+      return null;
+    }
+  });
+  workerBootstrapPreparationTail = preparation.then(() => undefined, () => undefined);
+  workerBootstrapPreparations.set(key, preparation);
+  void preparation.finally(() => {
+    if (workerBootstrapPreparations.get(key) === preparation) workerBootstrapPreparations.delete(key);
+  });
+  return preparation;
 }
 
 /**
@@ -4876,6 +5384,42 @@ function queueResumeCommand(sessionId: string, token: string): Command {
   const command = queue({ type: 'resume', sessionId, token });
   changed();
   return command;
+}
+
+/**
+ * Freeze the replacement chat's first provider turn before any bootstrap text crosses into the
+ * browser. A continuation fences rebinding for this session, but the remote agent process may
+ * legitimately have restarted while the handoff was being written; this is the point the new
+ * turn accepts that exact live instance. The frozen snapshot is durable with the command so a
+ * page retry/restart cannot silently pick a later instance.
+ */
+async function ensureResumeExecutionSnapshot(command: Command): Promise<ExecutionSnapshot> {
+  if (command.spec.type !== 'resume') throw new Error('resume execution proof requested for a non-resume command');
+  if (command.spec.executionSnapshot) return { ...command.spec.executionSnapshot };
+  const session = await getSession(command.spec.sessionId);
+  if (!session?.executionTarget) {
+    throw new Error('TARGET_CONTEXT_UNRESOLVED: the resumed session has no durable execution target');
+  }
+  const executionSnapshot = await freezeExecution(session.executionTarget, session.id, command.id);
+  const spec: Extract<CommandSpec, { type: 'resume' }> = { ...command.spec, executionSnapshot };
+  const stored = await writeCommandTransition(command, async () => {
+    if (!commands.includes(command) || command.spec.type !== 'resume') return false;
+    if (command.spec.executionSnapshot) return true;
+    const record: DurableCommandRecord = { ...durableCommand(command), spec };
+    try {
+      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+    } catch (error) {
+      persistCommands();
+      logWarn(`bridge: could not persist resumed execution snapshot for ${specKey(command.spec)} — ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    command.spec = spec;
+    return true;
+  });
+  if (!stored || command.spec.type !== 'resume' || !command.spec.executionSnapshot) {
+    throw new Error('TARGET_CONTEXT_UNRESOLVED: the resume execution snapshot was not durably frozen');
+  }
+  return { ...executionSnapshot };
 }
 
 // ----------------------------------------------------------------- delivery
@@ -7453,6 +7997,15 @@ function scheduleDeliver(): void {
  * its swarm — travels through the rebind instead, and none of it depends on the model doing
  * anything at all.
  */
+function workerBootstrapText(agent: string, task: string): string {
+  return (
+    `${task}\n\n` +
+    `(Chat On Steroids: you are ${agent}, a worker. Report to prime through the agents tool — ` +
+    'action=message to="prime" as you go, action=finish once at the end. Workers cannot reach each other. ' +
+    'ultrathink)'
+  );
+}
+
 function bootstrapText(spec: CommandSpec, summary: string): string {
   if (spec.type === 'stop') return '';
   if (spec.type === 'revive') {
@@ -7476,12 +8029,7 @@ function bootstrapText(spec: CommandSpec, summary: string): string {
     // one agent here that gets a task with no conversation in front of it and no chance to
     // ask a clarifying question, so the one thing worth spending a token on is asking it to
     // think before it starts.
-    return (
-      `${spec.task}\n\n` +
-      `(Chat On Steroids: you are ${spec.agent}, a worker. Report to prime through the agents tool — ` +
-      'action=message to="prime" as you go, action=finish once at the end. Workers cannot reach each other. ' +
-      'ultrathink)'
-    );
+    return workerBootstrapText(spec.agent, spec.task);
   }
   return resumeBootstrapText(summary, spec.token);
 }
@@ -7790,6 +8338,42 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
   ) {
     return null;
   }
+  let workerBootstrap: CommandReceipt['workerBootstrap'];
+  const proof = raw.workerBootstrap;
+  if (proof && typeof proof === 'object') {
+    const execution = executionSnapshotSchema.safeParse(proof.executionSnapshot);
+    if (
+      typeof proof.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(proof.agent) &&
+      typeof proof.runId === 'string' && proof.runId.length > 0 && proof.runId.length <= 128 &&
+      typeof proof.sessionId === 'string' && /^[a-z0-9-]{8,64}$/i.test(proof.sessionId) &&
+      execution.success && execution.data.sessionId === proof.sessionId && execution.data.inputId === raw.id &&
+      (proof.requestId === null || (typeof proof.requestId === 'string' && proof.requestId.length > 0 && proof.requestId.length <= 200))
+    ) {
+      workerBootstrap = {
+        agent: proof.agent,
+        runId: proof.runId,
+        sessionId: proof.sessionId,
+        executionSnapshot: execution.data,
+        requestId: proof.requestId
+      };
+    }
+  }
+  let resumeBootstrap: CommandReceipt['resumeBootstrap'];
+  const resumeProof = raw.resumeBootstrap;
+  if (resumeProof && typeof resumeProof === 'object') {
+    const execution = executionSnapshotSchema.safeParse(resumeProof.executionSnapshot);
+    if (
+      typeof resumeProof.sessionId === 'string' && /^[a-z0-9-]{8,64}$/i.test(resumeProof.sessionId) &&
+      typeof resumeProof.userMessageId === 'string' && resumeProof.userMessageId.length > 0 && resumeProof.userMessageId.length <= 256 &&
+      execution.success && execution.data.sessionId === resumeProof.sessionId && execution.data.inputId === raw.id
+    ) {
+      resumeBootstrap = {
+        sessionId: resumeProof.sessionId,
+        executionSnapshot: execution.data,
+        userMessageId: resumeProof.userMessageId
+      };
+    }
+  }
   return {
     id: raw.id,
     client: typeof raw.client === 'string' ? raw.client : null,
@@ -7797,7 +8381,9 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
     outcome: raw.outcome,
     committed: raw.committed,
     error: typeof raw.error === 'string' ? raw.error.slice(0, 200) : null,
-    completedAt: Number(raw.completedAt)
+    completedAt: Number(raw.completedAt),
+    ...(workerBootstrap ? { workerBootstrap } : {}),
+    ...(resumeBootstrap ? { resumeBootstrap } : {})
   };
 }
 
@@ -7807,7 +8393,7 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
  * Worker/revival rows are scoped to the exact restored run. Resume rows are scoped by the
  * continuation WAL. Returning null is therefore a retirement decision, not a parse fallback.
  */
-function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): CommandSpec | null {
+function restoredCommandSpec(version: number, raw: Partial<CommandSpec>, commandId: string): CommandSpec | null {
   if (raw.type === 'stop') {
     const stop = raw as Partial<Extract<CommandSpec, { type: 'stop' }>>;
     if (typeof stop.sessionId !== 'string' || !/^[a-z0-9-]{8,64}$/i.test(stop.sessionId) ||
@@ -7817,15 +8403,20 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}) };
   }
   if (
-    version >= 3 &&
+    version >= 5 &&
     raw.type === 'worker' &&
     typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).agent === 'string' &&
     /^[a-z0-9-]{1,40}$/i.test((raw as Extract<CommandSpec, { type: 'worker' }>).agent) &&
     typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).task === 'string' &&
-    typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).runId === 'string'
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).runId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).primeConversationId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).sessionId === 'string'
   ) {
     const worker = raw as Extract<CommandSpec, { type: 'worker' }>;
     if (!swarmRunning(worker.runId)) return null;
+    if (primeConversation(worker.runId) !== worker.primeConversationId) return null;
+    const execution = executionSnapshotSchema.safeParse(worker.executionSnapshot);
+    if (!execution.success || execution.data.sessionId !== worker.sessionId || execution.data.inputId !== commandId) return null;
     // A retained transport may deliberately outlive its live queue entry while broker failure
     // is being fsynced. If restart sees the *newer* broker side first, a terminal/sleeping row is
     // proof this old bootstrap must not be resurrected merely because its run id still matches a
@@ -7842,7 +8433,10 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
       task: worker.task.slice(0, 512 * 1024),
       model: isModelSlug(worker.model) ? worker.model : null,
       reasoningEffort: isReasoningEffort(worker.reasoningEffort) ? worker.reasoningEffort : null,
-      runId: worker.runId
+      runId: worker.runId,
+      primeConversationId: worker.primeConversationId,
+      sessionId: worker.sessionId,
+      executionSnapshot: execution.data
     };
   }
   if (
@@ -7876,7 +8470,14 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     const resume = raw as Extract<CommandSpec, { type: 'resume' }>;
     const continuation = continuationByToken(resume.token);
     if (!continuation || continuation.sessionId !== resume.sessionId || continuation.state === 'aborted') return null;
-    return { type: 'resume', sessionId: resume.sessionId, token: resume.token };
+    const execution = executionSnapshotSchema.safeParse(resume.executionSnapshot);
+    return {
+      type: 'resume',
+      sessionId: resume.sessionId,
+      token: resume.token,
+      ...(execution.success && execution.data.sessionId === resume.sessionId && execution.data.inputId === commandId
+        ? { executionSnapshot: execution.data } : {})
+    };
   }
   return null;
 }
@@ -7888,7 +8489,7 @@ function restoredCommandSnapshot(
   now: number
 ): DurableCommandSnapshot {
   return {
-    version: 4,
+    version: 5,
     commands: plannedCommands.map(durableCommand),
     receipts: plannedReceipts
       .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
@@ -7909,7 +8510,7 @@ function planCommandRestore(
   now: number
 ): CommandRestorePlan | null {
   const version = saved.version;
-  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 || !Array.isArray(saved.commands)) return null;
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 || !Array.isArray(saved.commands)) return null;
 
   const plannedCommands = [...commands];
   const plannedReceipts = commandReceipts
@@ -7954,7 +8555,7 @@ function planCommandRestore(
   for (const raw of saved.commands as Array<Partial<DurableCommandRecord>>) {
     const specRaw = raw.spec as Partial<CommandSpec> | undefined;
     if (!specRaw || typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 64) continue;
-    const spec = restoredCommandSpec(version, specRaw);
+    const spec = restoredCommandSpec(version, specRaw, raw.id);
     if (!spec) continue;
     const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : 0;
     const key = specKey(spec);
@@ -7995,9 +8596,12 @@ function planCommandRestore(
       spec,
       createdAt,
       claimedAt,
-        timer: null,
+      timer: null,
       lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
-      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null
+      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null,
+      bootstrapRequestId: spec.type === 'worker' && typeof raw.bootstrapRequestId === 'string' && raw.bootstrapRequestId.length <= 200
+        ? raw.bootstrapRequestId
+        : null
     });
     restored += 1;
   }
@@ -8121,6 +8725,8 @@ export function resetBridgeForTests(): void {
   commandReceipts = [];
   commandRetirementsAwaitingBroker.clear();
   commandWrites.clear();
+  workerBootstrapPreparations.clear();
+  workerBootstrapPreparationTail = Promise.resolve();
   commandRedeems.clear();
   bridgeRecovering = false;
   bridgeShutdownRequested = false;
@@ -8143,6 +8749,7 @@ export function resetBridgeForTests(): void {
   lastBrowserLaunchAt = 0;
   lastSeenAt = null;
   extensionVersion = null;
+  observedExtensionProtocol = null;
   versionWarned = false;
   requestWindow = { start: Date.now(), count: 0 };
 }

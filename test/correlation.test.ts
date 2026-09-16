@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushDurable, initDurableStore, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
 import {
@@ -15,6 +16,8 @@ import {
   observeRequestCorrelations,
   requestCorrelation,
   awaitRequestCorrelation,
+  awaitRequestExecution,
+  enrichRequestCorrelationsForInput,
   restoreRequestCorrelations,
   resetCorrelationRegistryForTests
 } from '../src/main/session/correlation.js';
@@ -116,6 +119,48 @@ describe('request correlation ownership', () => {
 
     expect(requestCorrelation(requestId)?.conversationId).toBe('conv-a');
     expect(requestCorrelation(requestId)?.sessionId).toBe('session-a');
+  });
+
+  it('strengthens one proven request with only the exact authored input snapshot and wakes execution waiters', async () => {
+    const requestId = 'wfr_execution_snapshot';
+    const conversationId = 'conv-execution';
+    const sessionId = 'session-execution';
+    const userMessageId = 'provider-user-execution';
+    const inputId = randomUUID();
+    observeRequestCorrelation({
+      requestId, conversationId, sessionId, userMessageId,
+      messageId: 'connector-message', tool: 'read', observedAt: 1
+    });
+    const waiting = awaitRequestExecution(requestId, 1000);
+    const executionSnapshot = {
+      nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1,
+      sessionId, inputId, machineId: 'local', agentInstanceId: 'agent-execution'
+    };
+    expect(enrichRequestCorrelationsForInput({ conversationId, userMessageId, inputId, executionSnapshot })).toBe(1);
+    await expect(waiting).resolves.toMatchObject({ inputId, executionSnapshot });
+  });
+
+  it('never cross-splices a different input snapshot into an already strengthened request owner', () => {
+    const requestId = 'wfr_execution_cross_splice';
+    const conversationId = 'conv-cross-splice';
+    const sessionId = 'session-cross-splice';
+    const userMessageId = 'provider-user-cross-splice';
+    const firstInputId = randomUUID();
+    const secondInputId = randomUUID();
+    observeRequestCorrelation({
+      requestId, conversationId, sessionId, userMessageId, inputId: firstInputId,
+      messageId: 'connector-first', tool: 'read', observedAt: 1
+    });
+    expect(observeRequestCorrelation({
+      requestId, conversationId, sessionId, userMessageId, inputId: secondInputId,
+      executionSnapshot: {
+        nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1,
+        sessionId, inputId: secondInputId, machineId: 'local', agentInstanceId: 'agent-cross-splice'
+      },
+      messageId: 'connector-second', tool: 'exec_command', observedAt: 2
+    })).toBe('same');
+    expect(requestCorrelation(requestId)).toMatchObject({ inputId: firstInputId });
+    expect(requestCorrelation(requestId)?.executionSnapshot).toBeUndefined();
   });
 
   /**

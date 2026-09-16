@@ -5,6 +5,7 @@ import sharp from 'sharp';
 import { expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { initSessionStore, createSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
@@ -27,7 +28,10 @@ it('carries validated user image bytes through an exact-session MCP result and a
     const session = await createSession({ conversationId, title: 'Image injection test' });
     await observeSessionModel(session.id, conversationId, 'gpt-6-astra', Date.now());
     await appendEvent(session.id, { kind: 'turn_start', source: 'extension', turnId: 'held-image-turn', time: Date.now() });
-    expect(observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, messageId: 'image-message', tool: 'read', observedAt: Date.now() })).toBe('stored');
+    const inputId = randomUUID();
+    const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+    expect(observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, inputId, executionSnapshot,
+      messageId: 'image-message', tool: 'read', observedAt: Date.now() })).toBe('stored');
     const bytes = await sharp({ create: { width: 12, height: 12, channels: 3, background: '#437b79' } }).webp().toBuffer();
     const images = [{ name: 'reference.webp', dataUrl: `data:image/webp;base64,${bytes.toString('base64')}` }];
     await validateInputImages(images);

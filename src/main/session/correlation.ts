@@ -26,6 +26,7 @@
 
 import { readDurable, writeDurableSnapshotSoon } from '../durable.js';
 import { indexedSessions, readRecentEvents } from './store.js';
+import { executionSnapshotSchema, type ExecutionSnapshot } from '../../shared/nodes.js';
 
 export interface RequestCorrelation {
   requestId: string;
@@ -35,6 +36,12 @@ export interface RequestCorrelation {
   messageId: string;
   tool: string;
   observedAt: number;
+  /** Exact provider user message whose response turn owns this workflow, when observed. */
+  userMessageId?: string | null;
+  /** Exact app outbox input that authored that user message, when proven. */
+  inputId?: string;
+  /** Frozen execution authority copied from that exact outbox input. */
+  executionSnapshot?: ExecutionSnapshot;
 }
 
 const MAX_CORRELATIONS = 50_000;
@@ -47,7 +54,7 @@ const CORRELATIONS_STATE = 'request-correlations';
  * read the owner out of the wrapper when one is there, and let a forgotten id be proved again
  * by exact evidence or by the recorded history reconciled below.
  */
-const CORRELATIONS_STATE_VERSION = 5;
+const CORRELATIONS_STATE_VERSION = 6;
 
 const byRequest = new Map<string, RequestCorrelation>();
 const waiters = new Map<string, Set<() => void>>();
@@ -116,13 +123,26 @@ function persist(): void {
 function validCorrelation(value: unknown): value is RequestCorrelation {
   if (!value || typeof value !== 'object') return false;
   const item = value as Partial<RequestCorrelation>;
+  const execution = item.executionSnapshot === undefined
+    ? null
+    : executionSnapshotSchema.safeParse(item.executionSnapshot);
+  const executionConsistent = execution === null || (
+    execution.success &&
+    typeof item.inputId === 'string' &&
+    execution.data.inputId === item.inputId &&
+    execution.data.sessionId === item.sessionId
+  );
   return (
     typeof item.requestId === 'string' && item.requestId.length > 0 && item.requestId.length <= 200 &&
     typeof item.conversationId === 'string' && item.conversationId.length > 0 && item.conversationId.length <= 200 &&
     typeof item.sessionId === 'string' && /^[0-9a-z-]{8,64}$/i.test(item.sessionId) &&
     typeof item.messageId === 'string' && item.messageId.length > 0 && item.messageId.length <= 300 &&
     typeof item.tool === 'string' && item.tool.length <= 100 &&
-    typeof item.observedAt === 'number' && Number.isFinite(item.observedAt)
+    typeof item.observedAt === 'number' && Number.isFinite(item.observedAt) &&
+    (item.userMessageId === undefined || item.userMessageId === null ||
+      (typeof item.userMessageId === 'string' && item.userMessageId.length > 0 && item.userMessageId.length <= 256)) &&
+    (item.inputId === undefined || (typeof item.inputId === 'string' && /^[0-9a-f-]{36}$/i.test(item.inputId))) &&
+    executionConsistent
   );
 }
 
@@ -164,6 +184,26 @@ function merge(input: RequestCorrelation): 'stored' | 'same' | 'refused' {
   // Refused, and nothing else: the entry does not change and no waiter is woken, because a
   // claim this registry does not believe is not an answer for anybody waiting on the id.
   if (previous.conversationId !== input.conversationId) return 'refused';
+
+  // Request ids are workflow-scoped and the original local session epoch remains authoritative.
+  // Later same-conversation evidence may strengthen that proof with the exact authored input,
+  // but it may never drag the workflow into a newer Compact & Resume epoch.
+  if (previous.sessionId === input.sessionId) {
+    if (!previous.userMessageId && input.userMessageId) previous.userMessageId = input.userMessageId;
+    // Input authority is stronger than conversation ownership: it is accepted only when both
+    // observations name the same exact provider user message. A later same-conversation call
+    // may not cross-splice a different input id or snapshot into an already strengthened owner.
+    const sameUser = !!previous.userMessageId && previous.userMessageId === input.userMessageId;
+    const candidateInput = sameUser && input.inputId ? input.inputId : null;
+    if (candidateInput && !previous.inputId) previous.inputId = candidateInput;
+    const sameInput = !!candidateInput && previous.inputId === candidateInput;
+    if (
+      sameInput &&
+      !previous.executionSnapshot &&
+      input.executionSnapshot?.sessionId === previous.sessionId &&
+      input.executionSnapshot.inputId === candidateInput
+    ) previous.executionSnapshot = { ...input.executionSnapshot };
+  }
 
   if (input.observedAt > previous.observedAt) {
     previous.observedAt = input.observedAt;
@@ -281,13 +321,24 @@ export function observeRequestCorrelations(
 ): Array<'stored' | 'same' | 'refused'> {
   let changed = false;
   const results = inputs.map((input) => {
-    const previousObservedAt = byRequest.get(input.requestId)?.observedAt;
+    const previous = byRequest.get(input.requestId);
+    const previousObservedAt = previous?.observedAt;
+    const previousInputId = previous?.inputId;
+    const previousExecution = previous?.executionSnapshot;
+    const previousUserMessageId = previous?.userMessageId;
     const result = merge(input);
     // A same-owner observation can still advance durable freshness/order. Persist that too so
     // an app restart cannot resurrect the pre-refresh eviction order. A refusal changes nothing
     // and therefore writes nothing.
-    if (result === 'stored' || (result === 'same' && previousObservedAt !== undefined && input.observedAt > previousObservedAt)) {
+    const current = byRequest.get(input.requestId);
+    if (result === 'stored' || (result === 'same' && (
+      (previousObservedAt !== undefined && input.observedAt > previousObservedAt) ||
+      previousInputId !== current?.inputId ||
+      previousExecution !== current?.executionSnapshot ||
+      previousUserMessageId !== current?.userMessageId
+    ))) {
       changed = true;
+      if (current?.executionSnapshot) wake(input.requestId);
     }
     return result;
   });
@@ -295,11 +346,73 @@ export function observeRequestCorrelations(
   return results;
 }
 
+/**
+ * Waits for the exact request owner to be strengthened with the exact outbox execution snapshot.
+ * Conversation ownership alone is not execution authority for a session-bound computer target.
+ */
+export async function awaitRequestExecution(
+  requestId: string | null | undefined,
+  timeoutMs: number
+): Promise<RequestCorrelation | null> {
+  if (!requestId) return null;
+  const deadline = performance.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    const held = requestCorrelation(requestId);
+    if (held?.executionSnapshot) return held;
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return held;
+    let timer: NodeJS.Timeout | null = null;
+    await new Promise<void>((resolve) => {
+      const set = waiters.get(requestId) ?? new Set<() => void>();
+      set.add(resolve);
+      waiters.set(requestId, set);
+      timer = setTimeout(() => {
+        set.delete(resolve);
+        if (set.size === 0) waiters.delete(requestId);
+        resolve();
+      }, remaining);
+      timer.unref?.();
+    });
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Exact request-id lookup. An id no page has proved yet resolves to null. */
 export function requestCorrelation(requestId: string | null | undefined): RequestCorrelation | null {
   if (!requestId) return null;
   const held = byRequest.get(requestId);
   return held ? { ...held } : null;
+}
+
+/**
+ * Strengthens already-proved request owners after the browser Send receipt lands.
+ * The exact provider user-message id is the join; no timing/"latest input" fallback participates.
+ */
+export function enrichRequestCorrelationsForInput(input: {
+  conversationId: string;
+  userMessageId: string;
+  inputId: string;
+  executionSnapshot: ExecutionSnapshot;
+}): number {
+  if (input.executionSnapshot.sessionId.length === 0 || input.executionSnapshot.inputId !== input.inputId) return 0;
+  const updates: RequestCorrelation[] = [];
+  for (const owner of byRequest.values()) {
+    if (
+      owner.conversationId !== input.conversationId ||
+      owner.sessionId !== input.executionSnapshot.sessionId ||
+      owner.userMessageId !== input.userMessageId ||
+      (owner.inputId !== undefined && owner.inputId !== input.inputId) ||
+      owner.executionSnapshot
+    ) continue;
+    updates.push({
+      ...owner,
+      inputId: input.inputId,
+      executionSnapshot: { ...input.executionSnapshot }
+    });
+  }
+  if (updates.length === 0) return 0;
+  observeRequestCorrelations(updates);
+  return updates.length;
 }
 
 /**

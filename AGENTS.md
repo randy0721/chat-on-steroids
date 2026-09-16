@@ -22,7 +22,7 @@ the code currently does it. Known implementation gaps are collected in §21 inst
 mixed into the happy path as features.
 
 Source alignment: **2026-09-14**, including current working-tree changes. App/extension **2.1.11**,
-bridge protocol **13** in the checked declarations (`package.json`, `src/main/version.ts`,
+bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
 ## 1. What the whole app is meant to do
@@ -438,6 +438,14 @@ native conversation id as the route/server identity materializes. A `WEB:` local
 historical Fiber object, conflicting durable ids, active tab, timing, tool name, arrival order
 or “only generating chat” is never a replacement proof.
 
+Computer tools and worker spawn additionally require the durable input's frozen execution
+snapshot. `fiber.js` reports a user message's own `metadata.request_id` independently of text;
+`content.js` joins user/assistant descriptors by that id, never by neighboring turn order.
+Conversation-only acknowledgement cannot suppress a later exact user-message anchor.
+`bridge.ts` retains the late anchor even before Send ACK, and that exact ACK enriches waiting
+requests. Kernel admission waits for this proof for direct, nested and worker-spawn calls.
+Missing proof always fails closed; UI/session selection never repairs a missing request snapshot.
+
 `correlation.ts` keeps the first exact request owner and its **local session epoch**. Conflicting
 claims do not overwrite it. Proof has no time TTL but the index is bounded to 50,000 recently
 observed request ids; recorded exact calls reconcile the index on startup even when a snapshot
@@ -462,7 +470,7 @@ including Core's structured supplemental context. Current blocked, compacting, s
 inactive-worker restrictions veto delivery; the notice never grants permission or repeats work.
 
 `allowUnattributedCalls` permits ordinary tools and code mode without chat attribution,
-including computer use, approved file edits, shell commands and external plugin tools.
+including external plugin tools. Computer operations still require the frozen input proof above.
 Windows observations use a separate shared unattributed context so follow-up input works.
 Plan updates, agent operations, finish signals, chat-specific workspace selection and owned
 terminal access still require their actual owner; the setting cannot invent that identity.
@@ -663,7 +671,14 @@ remains scrollable at the cap. `scripts/verify-composer-layout.cjs` checks real 
 
 `session/start-input.ts` brings up the existing connection/bridge owners for an explicit send,
 waits for actual connector readiness, then calls `input.ts`. Pre-publication cancellation owns
-an AbortController; after enqueue, durable outbox state owns it. Browser startup failure leaves
+an AbortController; after enqueue, durable outbox state owns it. Renderer sends capture an
+explicit Local/remote opening selection or the existing binding epoch before async work.
+Main validates and freezes it before connector readiness waits, and enqueue verifies that same
+binding and executor before durable publication. Plans that auto-enqueue retain their original
+selection across navigation. Target/protocol failures show a modal and preserve authored drafts.
+Protocol 14 is required for exact user-message execution evidence. A known incompatible browser
+extension is rejected before send; rebuilding/restarting the app does not reload Chrome's cached
+extension scripts. Reload the shipped extension and refresh its ChatGPT pages after an update. Browser startup failure leaves
 a clearly queued input and an explicit retry action, not a fake unsent/sent result.
 
 An input contains stable UUID, session/project, authored text, automation/objective, requested

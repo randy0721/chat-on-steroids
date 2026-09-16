@@ -8,6 +8,7 @@ import type { UsageOverview } from '../shared/usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
+import type { ExecutionTarget } from '../shared/nodes.js';
 /**
  * The entire renderer-facing API.
  *
@@ -17,7 +18,18 @@ import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '..
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
+import type {
+  AppState,
+  Capabilities,
+  Config,
+  Diagnosis,
+  LogEntry,
+  OpeningExecutionSelection,
+  RemoteNodeSaveRequest,
+  RemoteWorkspaceValidation,
+  RendererNodeTestResult,
+  RendererNodeView
+} from '../shared/types.js';
 import type {
   Handoff,
   SessionEvent,
@@ -108,6 +120,16 @@ const api = {
   },
   attachText: (text: string) => call<InputAttachment>('sessions:attachText', { text }),
   getUsage: () => call<UsageOverview>('usage:get'),
+  listNodes: () => call<RendererNodeView[]>('nodes:list'),
+  saveNode: (request: RemoteNodeSaveRequest) => call<RendererNodeView>('nodes:save', request),
+  removeNode: (id: string) => call<boolean>('nodes:remove', { id }),
+  testNode: (id: string) => call<RendererNodeTestResult>('nodes:test', { id }),
+  connectNode: (id: string) => call<RendererNodeView>('nodes:connect', { id }),
+  disconnectNode: (id: string) => call<RendererNodeView>('nodes:disconnect', { id }),
+  validateNodeWorkspace: (nodeId: string, workspace: string) =>
+    call<RemoteWorkspaceValidation>('nodes:validateWorkspace', { nodeId, workspace }),
+  rebindSessionExecution: (sessionId: string, nodeId: string, workspace?: string) =>
+    call<ExecutionTarget>('nodes:rebindSession', { sessionId, nodeId, ...(workspace !== undefined ? { workspace } : {}) }),
   getState: () => call<AppState>('state:get'),
   saveSettings: (patch: SettingsPatch, base: SettingsPatch) => call<AppState>('settings:save', { patch, base }),
   addRoot: () => call<AppState>('roots:add'),
@@ -166,7 +188,7 @@ const api = {
   compactSession: (id: string) => call<SessionControlsView>('sessions:compact', { id }),
   cancelSessionCompaction: (id: string) => call<SessionControlsView>('sessions:cancelCompaction', { id }),
   draftTaskPlan: (text: string, backend: 'api' | 'chatgpt', requestId?: string) => call<string[]>('sessions:plan', { text, backend, requestId }),
-  sendInput: (input: InputArgs) => call<InputEntry>('sessions:send', input),
+  sendInput: (input: InputArgs & { openingExecution?: OpeningExecutionSelection; expectedExecutionTarget?: ExecutionTarget }) => call<InputEntry>('sessions:send', input),
   retryInputBrowser: (id: string) => call<InputEntry | null>('sessions:retryBrowser', { id }),
   listInputs: () => call<InputEntry[]>('sessions:outbox'),
   listPausedHelpers: () => call<Array<{ id: string; sourceSessionId: string }>>('sessions:pausedHelpers'),

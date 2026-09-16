@@ -101,16 +101,15 @@ const CORE: SurfaceDefinition = {
   serverName: 'chat-on-steroids-core',
   connectorName: `${CONNECTOR_BRAND} Core`,
   description:
-    'Read and edit code and text files on this computer, and run commands in a real terminal. ' +
+    'Read and edit code and text files on the execution node bound to this chat, and run commands in its real terminal. ' +
     'Use for: opening and reading files, searching a repository, applying patches, creating, renaming and deleting files, ' +
     'running builds, tests, linters, git, npm and shell commands, continuing long-running or interactive terminal sessions, ' +
-    'and saving images and files ChatGPT generates onto this computer. ' +
-    'Core always exposes a windows tool for the remote Windows PC; when the Windows Desktop Commander plugin is ready, use that tool for Windows files, folders and commands through this same Core connector. Do not look for a separate Remote Desktop Commander connector. ' +
+    'and saving images and files ChatGPT generates onto that bound node when supported. The client binds the node; tools do not accept a machine selector, and an unavailable node is reported instead of falling back to another computer. ' +
     'Also searches and reads local recordings of previous or concurrently running ChatGPT work, and — when the user has ' +
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
-  cardSummary: 'Files, patches, the terminal, and a stable remote Windows entry point. Required — this is the coding connector.',
+  cardSummary: 'Files, patches, and the terminal on the chat-bound execution node. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'windows', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
 };
 
 /**
@@ -128,10 +127,10 @@ const DESKTOP: SurfaceDefinition = {
   serverName: 'chat-on-steroids-desktop',
   connectorName: `${CONNECTOR_BRAND} Desktop`,
   description:
-    'See and control this computer desktop, including its clipboard. ' +
+    'See and control the desktop bound to this chat’s execution node, including its clipboard. ' +
     'Use for: listing and launching apps, taking background window screenshots, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in native applications, ' +
-    'and reading the clipboard or copying and pasting text between programs.',
+    'and reading the clipboard or copying and pasting text between programs. Windows Window2 methods are stable across control hosts; local macOS also exposes observe/computer. Never use the control host as fallback for an unavailable bound node.',
   cardSummary:
     'Apps, background window screenshots, mouse/keyboard control and the clipboard. Optional — connect it only if you want desktop automation.',
   required: false,
@@ -158,13 +157,15 @@ export function surfaceDefinition(id: SurfaceId): SurfaceDefinition {
 
 /** Platform/capability projection used by setup; each registrar enforces the same split. */
 export function desktopToolNames(caps: Capabilities, platform: NodeJS.Platform = process.platform): string[] {
-  if (platform !== 'win32') return [...(caps.screen ? ['observe'] : []), ...(caps.control || caps.clipboardRead || caps.clipboardWrite ? ['computer'] : [])];
-  return [
+  const windows = [
     ...(caps.screen ? WINDOWS_COMPUTER_READ_METHODS : []),
     ...(caps.control ? WINDOWS_COMPUTER_INPUT_METHODS : []),
     ...(caps.clipboardRead ? ['read_clipboard'] : []),
     ...(caps.clipboardWrite ? ['write_clipboard'] : [])
   ];
+  return platform === 'darwin'
+    ? [...windows, ...(caps.screen ? ['observe'] : []), ...(caps.control || caps.clipboardRead || caps.clipboardWrite ? ['computer'] : [])]
+    : windows;
 }
 
 /**

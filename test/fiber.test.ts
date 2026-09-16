@@ -971,6 +971,21 @@ describe('the calls a turn says it made', () => {
     ]);
   });
 
+  it('preserves the exact user request anchor independently of rendered text and assistant turns', async () => {
+    const user: Message = { id: 'provider-user', recipient: 'all', author: { role: 'user' }, metadata: { request_id: 'wfr_split' } };
+    const assistant: Message = { id: 'provider-assistant', recipient: 'all', author: { role: 'assistant' }, metadata: { request_id: 'wfr_split' } };
+    const { turns } = await scan([], [{ id: 'user-turn', messages: [user] }, { id: 'assistant-turn', messages: [assistant] }]);
+    expect(turns[0]!.requests).toEqual([{ requestId: 'wfr_split', messageId: 'provider-user', createTime: null, userMessageId: 'provider-user' }]);
+    expect(turns[1]!.requests).toEqual([{ requestId: 'wfr_split', messageId: 'provider-assistant', createTime: null }]);
+  });
+
+  it('does not pick either user when one request id names conflicting user messages', async () => {
+    const { turns } = await scan([], [{ id: 'conflict', messages: ['user-a', 'user-b'].map(id => ({
+      id, recipient: 'all', author: { role: 'user' }, metadata: { request_id: 'wfr_conflict' }
+    })) }]);
+    expect(turns[0]!.requests).toEqual([{ requestId: 'wfr_conflict', messageId: 'user-a', createTime: null }]);
+  });
+
   it('reports a turn that has nothing but a request id', async () => {
     // Nothing rendered, no row, no result — the turn used to be dropped whole, taking the
     // one fact the app actually needs with it.

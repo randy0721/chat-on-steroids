@@ -57,44 +57,42 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
   const sessionTools = ctx.sessionTools ?? config.sessions.record;
   const agentTools = ctx.agentTools ?? config.multiAgent.enabled;
   const caps = ctx.caps;
-  const windows = platform === 'win32';
-  const desktop = windows || platform === 'darwin';
-  const host = platform === 'darwin' ? 'macOS' : platform === 'linux' ? 'Linux' : windows ? 'Windows' : 'local';
+  const controlHost = platform === 'darwin' ? 'macOS' : platform === 'linux' ? 'Linux' : platform === 'win32' ? 'Windows' : 'local';
   const roots = ctx.roots.length
     ? ctx.roots.map(root => `/${root.name}${isGitRepository(root.path) ? ' (git)' : ''}`).join('  ')
     : 'None yet.';
   const lines = [
     CODING_INSTRUCTIONS,
     '',
-    '# Local tools',
+    '# Bound computer tools',
     `Use the connected tools as needed: ${surfaceDefinition('core').connectorName} for files, terminal, plans, sessions and workers` +
-    (desktop ? `; ${surfaceDefinition('desktop').connectorName} for screen, input and clipboard` : '') +
+    ((caps.screen || caps.control || caps.clipboardRead || caps.clipboardWrite) ? `; ${surfaceDefinition('desktop').connectorName} for screen, input and clipboard` : '') +
     `; ${surfaceDefinition('plugins').connectorName} for enabled external apps and services.`,
-    `Host: ${host}. Roots: ${roots}`,
-    ctx.readOnly ? 'The local tools are read-only.' : 'Use the tools listed in this conversation.',
+    `Control host: ${controlHost}. Local-node approved roots: ${roots}. Computer tools may instead be bound to a remote node; the current-turn execution projection is authoritative for target OS, shell, workspace and roots.`,
+    ctx.readOnly ? 'The bound computer tools are read-only.' : 'Use the tools listed in this conversation.',
+    'The client, not the model, selects the execution node. Never infer or choose a machine from old paths, foreground UI state or tool arguments. If the bound node is unavailable, report that error; do not fall back to the control host or another node.',
     'Report the specific tool failure, not an inferred global restriction. Missing chat identity, an unavailable process session_id, or an output limit does not establish Read-only mode. Successful patches and commands remain completed work; continue other authorized work and never rerun a completed job just to recover its terminal.',
-    'An approved root may be the parent of the project. Use the exact project path and keep every intermediate folder; do not guess a missing project level.',
-    'Paths may be virtual under the roots above or absolute native paths inside them. Once this chat has a project, later paths may be relative to it. Use a full path to select another project.',
+    'An approved root may be the parent of the project. Use the exact target-node project path and keep every intermediate folder; do not guess a missing project level.',
+    'On the built-in local node, paths may be virtual under its roots or absolute native paths inside them. Remote-node paths belong to that remote OS and must never be interpreted or validated as control-host paths. Once this chat has a workspace, later relative paths resolve there.',
   ];
 
   if (caps.read || caps.browse || caps.metadata) lines.push(
     'read batches paths, lists folders, expands globs and returns numbered text. Read related files together. Read whole files for orientation; use a known region when that is enough. A start_line/end_line range applies to every file the call reads.',
   );
-  if (caps.read) lines.push('view_image inspects a local image. Use it when visual evidence matters.');
+  if (caps.read) lines.push('view_image inspects an image on the chat-bound execution node. Use it when visual evidence matters.');
   if (caps.command) {
     lines.push(
       'Use rg or rg --files for repository searches; if unavailable, use the next best tool.',
       'exec_command runs git, builds, tests and shell commands. Batch related checks with exec_command cmds: [...]; they run sequentially in one shell with per-command output and exit codes.',
-      'Set workdir to the project. workdir accepts virtual paths; paths inside cmd are not translated, so use paths relative to workdir or native filesystem paths.',
+      'Set workdir to the target workspace. Local workdir may use approved virtual paths; remote workdir is a native path on that remote OS. Paths inside cmd are not translated.',
       'A running command returns a session_id. Continue that same process with write_stdin; inspect its terminal result before reporting completion. After a transient wait failure, keep the same session instead of starting replacement work.',
-      'Output is capped. When truncated, narrow the command or read the relevant region rather than repeating the same request.'
+      'Output is capped. When truncated, narrow the command or read the relevant region rather than repeating the same request.',
+      'On a Windows target, follow PowerShell quoting/operator rules and use Windows-native paths. On a POSIX target, use its normal zsh/bash/sh semantics. The current-turn execution projection names the target system and default terminal.'
     );
-    if (windows) lines.push(
-      'PowerShell does not expand * or ? for native programs: pass ripgrep filename patterns as -g \'*.go\', and expand other globs with Get-ChildItem.',
-      'Bare rg/ripgrep is bound to the app’s bundled ripgrep. In Windows PowerShell, omit 2>&1 on native programs: stderr is already captured and that redirect can leave $? false after exit 0.',
-      ...(LAUNCHES_WINDOWS_POWERSHELL_5 ? ['This is Windows PowerShell 5.1, without && or ||. Use cmds or A; if ($?) { B }.'] : [])
+    lines.push(
+      'For Windows PowerShell targets, native programs do not expand * or ?: pass ripgrep filename patterns with -g and expand other globs explicitly. Omit 2>&1 on native programs because stderr is already captured.',
+      ...(LAUNCHES_WINDOWS_POWERSHELL_5 ? ['When the target uses Windows PowerShell 5.1, && and || are unavailable. Use cmds or A; if ($?) { B }.'] : [])
     );
-    else lines.push('exec_command uses the host’s normal POSIX shell (zsh/bash/sh unless requested otherwise). The bundled ripgrep directory is first on PATH.');
   } else if (ctx.exposedFind ?? caps.search) {
     lines.push('find searches filenames or file contents without a shell. Narrow path and include patterns to the relevant area.');
   }
@@ -125,7 +123,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     '',
     'session_finish is for Astra only when the user prompt explicitly requests it. Follow that prompt’s finish timing after implementation; complete newly delivered work. It is not a plan/progress update or a way to collect queued tasks. Workers use agents action=finish instead.'
   );
-  if (desktop && (caps.screen || caps.control || caps.clipboardRead || caps.clipboardWrite)) lines.push(
+  if (caps.screen || caps.control || caps.clipboardRead || caps.clipboardWrite) lines.push(
     '',
     `Native screen, window, mouse, keyboard and clipboard tools live in the separate "${surfaceDefinition('desktop').connectorName}" connector. If the task needs them and they are unavailable, tell the user which connector is needed.`
   );
@@ -135,10 +133,11 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
 
 function desktopInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
   if (platform === 'win32') return windowsDesktopInstructions();
-  const host = platform === 'darwin' ? 'Mac' : 'Windows PC';
+  const host = platform === 'darwin' ? 'local macOS target' : 'local desktop target';
   const paste = platform === 'darwin' ? 'command+v' : 'ctrl+v';
   const lines = [
-    `Local desktop control: look at this ${host}’s screen and windows, and drive its mouse and keyboard.`,
+    'Desktop execution is chat-bound. The client, not tool arguments or the currently selected UI, decides which computer receives a call. Never fall back to the control host when the bound node is unavailable.',
+    `For a ${host}, use observe/computer as described below. For a bound Windows target, use the Window2 named methods (list_apps, list_windows, get_window, launch_app, get_window_state, click, press_key, type_text, scroll, set_value, drag, perform_secondary_action, activate_window); do not use observe/computer as a Windows fallback.`,
     '',
     'observe first, then computer. Choose the task-specific window from observe what=windows, then inspect it with what=window.',
     'A bare observe() returns the foreground window, its screenshot and accessibility controls. Observation does not activate the window.',

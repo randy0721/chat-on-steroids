@@ -100,6 +100,7 @@ const { createSession, deleteSession, findSessionByConversation, getSession, ini
   '../src/main/session/store.js'
 );
 const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { requestCorrelation } = await import('../src/main/session/correlation.js');
 const { resetBlockedChatsForTests, setChatBlocked } = await import('../src/main/session/blocked-chats.js');
 const {
   CONTINUATIONS_STATE,
@@ -131,7 +132,7 @@ const {
   repairPrimeConversationAfterRecovery,
   requestWorkerBootstraps,
   requestWorkerRevivals,
-  spawn,
+  spawn: spawnWithoutExecutionProof,
   stageMessages,
   pendingWorkerSpawns,
   onSwarmPersistNow,
@@ -156,6 +157,24 @@ const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 const PRIME_CHAT = 'c-prime-bridge';
 /** The chat a worker lands in when its bootstrap ACK is lost and `/events` binds it instead. */
 const LOST_ACK_CHAT = 'bcbcbcbc-1111-2222-3333-444444444444';
+
+/**
+ * Direct broker tests bypass the MCP call context that normally supplies execution authority.
+ * Give those synthetic spawns an explicit frozen local target so they exercise the worker
+ * lifecycle with the same proof production requires. Tests for missing proof call the raw
+ * `spawnWithoutExecutionProof` seam instead.
+ */
+function spawn(input: Parameters<typeof spawnWithoutExecutionProof>[0]): ReturnType<typeof spawnWithoutExecutionProof> {
+  return spawnWithoutExecutionProof({
+    ...input,
+    executionTarget: input.executionTarget ?? {
+      nodeId: 'local',
+      workspace: null,
+      bindingVersion: 1,
+      nodeConfigVersion: 1
+    }
+  });
+}
 
 /**
  * A continuation that has already been given its brief, ready to be queued.
@@ -294,6 +313,15 @@ function wake(items: ReadonlyArray<{ to: string; text: string }>): void {
 
 async function waitForOpened(count = 1): Promise<void> {
   await vi.waitFor(() => expect(opened).toHaveLength(count));
+}
+
+async function waitForPendingCommand(what: string): Promise<ReturnType<typeof pendingCommands>[number]> {
+  let found: ReturnType<typeof pendingCommands>[number] | undefined;
+  await vi.waitFor(() => {
+    found = pendingCommands().find((command) => command.what === what);
+    expect(found).toBeDefined();
+  });
+  return found!;
 }
 
 async function waitForRevival(): Promise<{ id: string; conversationId: string }> {
@@ -1187,7 +1215,7 @@ describe('activity feed', () => {
 
   it('pages by sequence number so the extension never re-reads what it has', async () => {
     await pair();
-    const conversationId = '12121212-3434-5656-7878-909090909090';
+    const conversationId = '13131313-3434-5656-7878-909090909091';
     await request('POST', '/events', {
       body: { conversationId, events: [
           { kind: 'turn_start', time: Date.now(), turnId: 't' },
@@ -2455,7 +2483,7 @@ describe('delivering a bootstrap', () => {
     await pair();
     spawn({ workers: [{ task: 'audit the compaction' }], caller: { conversationId: PRIME_CHAT } });
     const command = await redeem();
-    const conversationId = 'abcdef12-3456-7890-abcd-ef1234567890';
+    const conversationId = 'abcdef13-3456-7890-abcd-ef1234567891';
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('invited');
 
     await request('POST', '/commands/ack', {
@@ -2548,7 +2576,7 @@ describe('delivering a bootstrap', () => {
     expect(first.body).toMatchObject({ final: true, committed: true, conversationId });
     await flushDurable();
     const stored = await readDurable<{ version?: number; receipts?: Array<{ id?: string }> }>('bridge-commands');
-    expect(stored?.version).toBe(4);
+    expect(stored?.version).toBe(5);
     expect(stored?.receipts?.some((entry) => entry.id === command.id)).toBe(true);
 
     // Simulate the main-process restart after the durable commit but before the browser got
@@ -2649,7 +2677,8 @@ describe('delivering a bootstrap', () => {
         events: [{ kind: 'progress', time: Date.now(), text: 'old extension shape' }]
       }
     });
-    expect(missingRun.status).toBe(200);
+    expect(missingRun.status).toBe(409);
+    expect(missingRun.body.error).toBe('opening_session_pending');
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.conversationId).toBeNull();
 
     const recovered = await request('POST', '/events', {
@@ -3032,7 +3061,7 @@ describe('delivering a bootstrap', () => {
     await pair();
     spawn({ workers: [{ task: 'sleep and wake for recovery validation' }], caller: { conversationId: PRIME_CHAT } });
     const bootstrap = await redeem();
-    const conversationId = 'abababab-1111-4222-8333-444444444444';
+    const conversationId = 'acacacac-1111-4222-8333-444444444445';
     await request('POST', '/commands/ack', {
       body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
     });
@@ -4169,11 +4198,11 @@ describe('delivering a bootstrap', () => {
     expect(first.agent).toBe('worker-1');
     const second = await redeem();
     expect(second.agent).toBe('worker-2');
-    const secondConversation = '22222222-3333-4444-5555-666666666666';
+    const secondConversation = '44444444-3333-4444-5555-666666666668';
     await request('POST', '/commands/ack', {
       body: { id: second.id, status: 'sent', conversationId: secondConversation, agent: 'worker-2' }
     });
-    const firstConversation = '11111111-2222-3333-4444-555555555555';
+    const firstConversation = '33333333-2222-3333-4444-555555555557';
     await request('POST', '/commands/ack', {
       body: { id: first.id, status: 'sent', conversationId: firstConversation, agent: 'worker-1' }
     });
@@ -4313,7 +4342,8 @@ describe('delivering a bootstrap', () => {
    */
   it('runs the full lifecycle cleanup when the command queue overflows', async () => {
     await pair();
-    spawn({ workers: [{ task: 'the worker that gets pushed out of the queue' }], caller: { conversationId: PRIME_CHAT } });
+    const workerRun = spawn({ workers: [{ task: 'the worker that gets pushed out of the queue' }], caller: { conversationId: PRIME_CHAT } });
+    await waitForPendingCommand(`worker:${workerRun.runId}:worker-1`);
     expect(swarmState().agents.find((info) => info.id === 'worker-1')!.state).toBe('invited');
     expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']);
 
@@ -4960,8 +4990,10 @@ describe('a worker chat that never opens', () => {
       // worker-1's open failed and ended its command, so delivery advanced to worker-2 in the
       // same beat. That is the beat this guard exists for: worker-2 waits for the browser
       // worker-1 asked for instead of asking the operating system for a second one.
-      expect(attempts).toHaveLength(1);
-      expect(pendingCommands().some((command) => command.what === `worker:${currentRunId()}:worker-2`)).toBe(true);
+      await vi.waitFor(() => expect(attempts).toHaveLength(1));
+      await vi.waitFor(() =>
+        expect(pendingCommands().some((command) => command.what === `worker:${currentRunId()}:worker-2`)).toBe(true)
+      );
 
       // Still nothing has reported, so the launch is now one this app has stopped believing in
       // and worker-2 may have its own.
@@ -5005,6 +5037,165 @@ describe('a worker chat that never opens', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('freezes worker execution before browser delivery and grants it only to the exact opening workflow', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'prove frozen bootstrap authority' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem();
+    expect(command.id).toMatch(/^[0-9a-f-]{36}$/i);
+
+    const workerConversation = 'abababab-1111-4222-8333-555555555555';
+    // A generic provider request cannot choose an unbound worker opening merely because its page
+    // happens to be the one reporting first. The exact command id below is the missing proof.
+    const generic = await request('POST', '/correlations', {
+      body: {
+        conversationId: workerConversation,
+        calls: [{ messageId: 'connector-generic', requestId: 'wfr-worker-generic', tool: 'read', order: 0, answered: false }]
+      }
+    });
+    expect(generic.status).toBe(409);
+    expect(requestCorrelation('wfr-worker-generic')).toBeNull();
+
+    const openingRequestId = 'wfr-worker-opening';
+    const first = await request('POST', '/events', {
+      body: {
+        conversationId: workerConversation,
+        agent: 'worker-1',
+        agentCommandId: command.id,
+        events: [{
+          kind: 'tool_evidence',
+          time: Date.now(),
+          calls: [{
+            messageId: 'connector-worker-opening', requestId: openingRequestId, userMessageId: 'provider-worker-opening',
+            tool: 'read', order: 0, answered: false
+          }]
+        }]
+      }
+    });
+    expect(first.status).toBe(200);
+    const workerSession = await findSessionByConversation(workerConversation, { requireUnique: true });
+    expect(workerSession).toMatchObject({
+      conversationId: workerConversation,
+      origin: { kind: 'worker', agentId: 'worker-1', task: 'prove frozen bootstrap authority' },
+      executionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 }
+    });
+    const opening = requestCorrelation(openingRequestId);
+    expect(opening).toMatchObject({
+      conversationId: workerConversation,
+      sessionId: workerSession!.id,
+      inputId: command.id,
+      executionSnapshot: {
+        nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1,
+        sessionId: workerSession!.id, inputId: command.id, machineId: 'local', agentInstanceId: expect.any(String)
+      }
+    });
+
+    // The page keeps its worker command marker for the whole chat. That must not turn the marker
+    // into standing execution authority for every later turn: only the opening request claimed it.
+    const laterRequestId = 'wfr-worker-later';
+    const later = await request('POST', '/events', {
+      body: {
+        conversationId: workerConversation,
+        agent: 'worker-1',
+        agentCommandId: command.id,
+        events: [{
+          kind: 'tool_evidence',
+          time: Date.now() + 1,
+          calls: [{
+            messageId: 'connector-worker-later', requestId: laterRequestId, userMessageId: 'provider-worker-later',
+            tool: 'exec_command', order: 0, answered: false
+          }]
+        }]
+      }
+    });
+    expect(later.status).toBe(200);
+    expect(requestCorrelation(laterRequestId)).toMatchObject({ conversationId: workerConversation, sessionId: workerSession!.id });
+    expect(requestCorrelation(laterRequestId)?.executionSnapshot).toBeUndefined();
+  });
+
+  it('freezes Compact & Resume execution before browser delivery and grants it only to the exact provider bootstrap message', async () => {
+    await pair();
+    const fromConversationId = 'aaaa9999-1111-4222-8333-777777777777';
+    const { sessionId, token } = await compactedSession(fromConversationId, 'continue with the frozen computer');
+    const queued = queueResume(sessionId, token)!;
+    const command = await redeem(queued.id);
+    expect(command.text).toContain('Current execution environment');
+
+    const conversationId = 'ddddaaaa-1111-4222-8333-999999999999';
+    const providerUserMessageId = 'provider-resume-opening';
+    const ack = await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId, userMessageId: providerUserMessageId }
+    });
+    expect(ack.status).toBe(200);
+
+    const openingRequestId = 'wfr-resume-opening';
+    const first = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{
+          kind: 'tool_evidence',
+          time: Date.now(),
+          calls: [{
+            messageId: 'connector-resume-opening', requestId: openingRequestId,
+            userMessageId: providerUserMessageId, tool: 'read', order: 0, answered: false
+          }]
+        }]
+      }
+    });
+    expect(first.status).toBe(200);
+    const resumed = await findSessionByConversation(conversationId, { requireUnique: true });
+    expect(resumed?.id).toBe(sessionId);
+    expect(requestCorrelation(openingRequestId)).toMatchObject({
+      conversationId,
+      sessionId,
+      inputId: command.id,
+      executionSnapshot: {
+        sessionId,
+        inputId: command.id,
+        nodeId: 'local',
+        bindingVersion: 1,
+        nodeConfigVersion: 1,
+        machineId: 'local',
+        agentInstanceId: expect.any(String)
+      }
+    });
+
+    const laterRequestId = 'wfr-resume-later';
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{
+          kind: 'tool_evidence',
+          time: Date.now() + 1,
+          calls: [{
+            messageId: 'connector-resume-later', requestId: laterRequestId,
+            userMessageId: 'provider-resume-later', tool: 'exec_command', order: 0, answered: false
+          }]
+        }]
+      }
+    });
+    expect(requestCorrelation(laterRequestId)).toMatchObject({ conversationId, sessionId });
+    expect(requestCorrelation(laterRequestId)?.executionSnapshot).toBeUndefined();
+  });
+
+  it('refuses a worker bootstrap before browser delivery when its spawn carried no exact execution proof', async () => {
+    await pair();
+    const created = spawnWithoutExecutionProof({
+      workers: [{ task: 'must not inherit a later target' }],
+      caller: { conversationId: PRIME_CHAT }
+    });
+
+    await vi.waitFor(() => {
+      const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((agent) => agent.id === 'worker-1');
+      expect(worker).toMatchObject({
+        state: 'failed',
+        result: expect.stringContaining('TARGET_CONTEXT_UNRESOLVED')
+      });
+    });
+    expect(created.created).toHaveLength(1);
+    expect(opened).toEqual([]);
+    expect(pendingCommands().some((command) => command.what === `worker:${created.runId}:worker-1`)).toBe(false);
   });
 
   it('fails an unredeemed opening without duplicating it or holding its sibling', async () => {
@@ -8362,7 +8553,8 @@ describe('restarting the bridge', () => {
     }
     await pair();
 
-    spawn({ workers: [{ task: 'work' }], caller: { conversationId: PRIME_CHAT } });
+    const run = spawn({ workers: [{ task: 'work' }], caller: { conversationId: PRIME_CHAT } });
+    await waitForPendingCommand(`worker:${run.runId}:worker-1`);
     expect(pendingCommands().map((command) => command.what)).toEqual([`worker:${currentRunId()}:worker-1`]);
 
     // A worker chat that has not opened yet must not open for a run that is over.
@@ -8372,7 +8564,8 @@ describe('restarting the bridge', () => {
 
   it('stops listening to the swarm while it is down', async () => {
     await pair();
-    spawn({ workers: [{ task: 'work' }], caller: { conversationId: PRIME_CHAT } });
+    const run = spawn({ workers: [{ task: 'work' }], caller: { conversationId: PRIME_CHAT } });
+    await waitForPendingCommand(`worker:${run.runId}:worker-1`);
     expect(pendingCommands()).toHaveLength(1);
 
     await stopBridge();
@@ -9780,7 +9973,7 @@ describe('the goal loop over the bridge', () => {
     await pair();
     spawn({ workers: [{ task: 'Audit the settings sheet' }], caller: { conversationId: PRIME_CHAT } });
     const command = await redeem();
-    const worker = 'cafe0022-0000-4000-8000-000000000022';
+    const worker = 'cafe0122-0000-4000-8000-000000000122';
     await request('POST', '/commands/ack', {
       body: { id: command.id, status: 'sent', agent: 'worker-1', conversationId: worker }
     });
@@ -9806,7 +9999,7 @@ describe('the goal loop over the bridge', () => {
     await pair();
     spawn({ workers: [{ task: 'Audit the settings sheet' }], caller: { conversationId: PRIME_CHAT } });
     const command = await redeem();
-    const worker = 'cafe0023-0000-4000-8000-000000000023';
+    const worker = 'cafe0123-0000-4000-8000-000000000123';
     await request('POST', '/commands/ack', {
       body: { id: command.id, status: 'sent', agent: 'worker-1', conversationId: worker }
     });
@@ -9855,7 +10048,7 @@ describe('the goal loop over the bridge', () => {
     await pair();
     spawn({ workers: [{ task: 'Audit the settings sheet' }], caller: { conversationId: PRIME_CHAT } });
     const command = await redeem();
-    const worker = 'cafe0024-0000-4000-8000-000000000024';
+    const worker = 'cafe0124-0000-4000-8000-000000000124';
     await request('POST', '/commands/ack', {
       body: { id: command.id, status: 'sent', agent: 'worker-1', conversationId: worker }
     });
@@ -10063,8 +10256,8 @@ describe('independent prime browser transports', () => {
     const parentB = await createSession({ title: 'Independent Prime B', conversationId: primeB });
     const a = spawn({ caller: { conversationId: primeA }, workers: [{ task: 'A isolated task' }] });
     const b = spawn({ caller: { conversationId: primeB }, workers: [{ task: 'B isolated task' }] });
-    const commandA = pendingCommands().find(c => c.what === `worker:${a.runId}:worker-1`)!;
-    const commandB = pendingCommands().find(c => c.what === `worker:${b.runId}:worker-1`)!;
+    const commandA = await waitForPendingCommand(`worker:${a.runId}:worker-1`);
+    const commandB = await waitForPendingCommand(`worker:${b.runId}:worker-1`);
     expect(commandA.id).not.toBe(commandB.id);
     clearAgent('prime', a.runId);
     expect(pendingCommands().map(c => c.id)).toEqual([commandB.id]);
@@ -10121,6 +10314,8 @@ describe('independent prime browser transports', () => {
     await pair();
     const a = spawn({ caller: { conversationId: primeA }, workers: [{ task: 'durable queued A' }] });
     const b = spawn({ caller: { conversationId: primeB }, workers: [{ task: 'durable queued B' }] });
+    await waitForPendingCommand(`worker:${a.runId}:worker-1`);
+    await waitForPendingCommand(`worker:${b.runId}:worker-1`);
     await flushDurable();
     const commandIds = pendingCommands().map(c => c.id);
     const saved = JSON.parse(JSON.stringify(snapshotSwarm()));

@@ -9,6 +9,7 @@
 
 import http from 'node:http';
 import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Caller } from '../src/main/agents.js';
 import * as chatModels from '../src/main/chat-models.js';
@@ -93,9 +94,10 @@ const {
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
-const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
+const { bindSessionExecutionTarget, createSession, findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
+const { freezeExecution } = await import('../src/main/nodes/router.js');
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceForChat } = await import('../src/main/workspace.js');
 const { DEFAULT_CAPABILITIES } = await import('../src/shared/types.js');
@@ -137,6 +139,18 @@ beforeEach(() => {
 
 const PRIME_CHAT = 'c-prime';
 const prime: Caller = { conversationId: PRIME_CHAT };
+const TEST_EXECUTION_TARGET = { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 } as const;
+
+async function exactExecutionFor(conversationId: string) {
+  let session = await findSessionByConversation(conversationId, { requireUnique: true });
+  if (!session) session = await createSession({ conversationId, executionTarget: TEST_EXECUTION_TARGET });
+  const target = session.executionTarget ?? await bindSessionExecutionTarget(session.id, {
+    nodeId: 'local',
+    workspace: null,
+    nodeConfigVersion: 1
+  });
+  return freezeExecution(target, session.id, randomUUID());
+}
 
 it('returns an empty exact-caller status without creating a family or exposing another prime', () => {
   const empty = { self: null, runId: null, state: { running: false, retainedHistory: false, agents: [] } };
@@ -2106,7 +2120,11 @@ describe('restart', () => {
       critical.push(snapshot);
     });
 
-    const staged = stageSpawn({ workers: [{ task: 'inspect topology' }], caller: prime });
+    const staged = stageSpawn({
+      workers: [{ task: 'inspect topology' }],
+      caller: prime,
+      executionTarget: TEST_EXECUTION_TARGET
+    });
 
     // The broker reserves the one global run while acceptance is in flight, but nothing that
     // can publish/open workers is allowed to see the planned topology yet.
@@ -2122,7 +2140,15 @@ describe('restart', () => {
 
     expect(swarmState().running).toBe(true);
     expect(snapshotSwarm()?.agents.map((entry) => entry.info.id)).toEqual(['prime', 'worker-1']);
-    expect(pendingWorkerSpawns()).toEqual([{ runId: staged.runId, primeConversationId: PRIME_CHAT, id: 'worker-1', model: null, reasoningEffort: null, task: 'inspect topology' }]);
+    expect(pendingWorkerSpawns()).toEqual([{
+      runId: staged.runId,
+      primeConversationId: PRIME_CHAT,
+      id: 'worker-1',
+      model: null,
+      reasoningEffort: null,
+      task: 'inspect topology',
+      executionTarget: TEST_EXECUTION_TARGET
+    }]);
     expect(ordinary.at(-1)?.agents.map((entry) => entry.info.id)).toEqual(['prime', 'worker-1']);
   });
 
@@ -2294,6 +2320,7 @@ describe('through the MCP endpoint', () => {
   ): Promise<Record<string, unknown>> => {
     const seq = ++evidenceSeq;
     const requestId = `wfr_agents_${seq}`;
+    const executionSnapshot = await exactExecutionFor(conversationId);
     const pending = replyWithRequestId(requestId, action, args);
     await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: Date.now(), turnId: `t-${seq}` },
@@ -2301,7 +2328,7 @@ describe('through the MCP endpoint', () => {
         kind: 'tool_evidence',
         time: Date.now(),
         turnId: `t-${seq}`,
-        calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
+        calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId, executionSnapshot }]
       }
     ]);
     return (await pending).result?.structuredContent ?? {};
@@ -2320,6 +2347,7 @@ describe('through the MCP endpoint', () => {
   const asChat = async (conversationId: string, action: string, args: Record<string, unknown> = {}): Promise<string> => {
     const seq = ++evidenceSeq;
     const requestId = `wfr_agents_${seq}`;
+    const executionSnapshot = await exactExecutionFor(conversationId);
     const pending = agentsWithRequestId(requestId, action, args);
     await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: Date.now(), turnId: `t-${seq}` },
@@ -2327,7 +2355,7 @@ describe('through the MCP endpoint', () => {
         kind: 'tool_evidence',
         time: Date.now(),
         turnId: `t-${seq}`,
-        calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
+        calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId, executionSnapshot }]
       }
     ]);
     return pending;
@@ -2374,16 +2402,33 @@ describe('through the MCP endpoint', () => {
     expect(Object.keys(schema.properties)).not.toContain('agent');
   });
 
+  it('waits for late input proof before freezing a worker invitation', async () => {
+    const { observeRequestCorrelation, enrichRequestCorrelationsForInput } = await import('../src/main/session/correlation.js');
+    const { inFlightMcpRequests } = await import('../src/main/mcp/call-context.js');
+    const conversationId = 'c-late-spawn-proof';
+    const requestId = 'wfr_late_spawn_proof';
+    const executionSnapshot = await exactExecutionFor(conversationId);
+    observeRequestCorrelation({ requestId, conversationId, sessionId: executionSnapshot.sessionId,
+      userMessageId: 'late-spawn-user', messageId: 'late-spawn-call', tool: 'agents', observedAt: Date.now() });
+    const pending = agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'use the frozen input target' }] });
+    await vi.waitFor(() => expect(inFlightMcpRequests()).toBeGreaterThan(0));
+    expect(pendingWorkerSpawns()).toEqual([]);
+    expect(enrichRequestCorrelationsForInput({ conversationId, userMessageId: 'late-spawn-user', inputId: executionSnapshot.inputId, executionSnapshot })).toBe(1);
+    expect(await pending).not.toContain('TARGET_CONTEXT_UNRESOLVED');
+    expect(pendingWorkerSpawns()[0]?.executionTarget).toEqual({ nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 });
+  });
+
   it('is identified by exact request-id evidence that arrived before the call it names', async () => {
     // Evidence may arrive before HTTP. The timestamp is irrelevant; the normalized request
     // id is the join, so a pre-existing exact mate remains authoritative.
+    const executionSnapshot = await exactExecutionFor('c-ahead');
     await recordChatObservations('c-ahead', [
       { kind: 'turn_start', time: Date.now() - 5_500, turnId: 't-ahead' },
       {
         kind: 'tool_evidence',
         time: Date.now() - 5_500,
         turnId: 't-ahead',
-        calls: [{ messageId: 'm-ahead', tool: 'agents', order: 0, answered: false, requestId: 'wfr_agents_ahead' }]
+        calls: [{ messageId: 'm-ahead', tool: 'agents', order: 0, answered: false, requestId: 'wfr_agents_ahead', executionSnapshot }]
       }
     ]);
 
@@ -2392,11 +2437,17 @@ describe('through the MCP endpoint', () => {
     expect(text).not.toContain('UNIDENTIFIED_CALLER');
     expect(swarmRunning()).toBe(true);
     expect(identify({ conversationId: 'c-ahead' }).id).toBe(PRIME_ID);
+    expect(pendingWorkerSpawns()[0]?.executionTarget).toEqual({
+      nodeId: executionSnapshot.nodeId,
+      workspace: executionSnapshot.workspace,
+      bindingVersion: executionSnapshot.bindingVersion,
+      nodeConfigVersion: executionSnapshot.nodeConfigVersion
+    });
   });
 
   it('refuses a spawn whose conversation this app cannot prove, and creates nothing', async () => {
     const text = await agents('spawn', { workers: [{ task: 'anything' }] });
-    expect(text).toMatch(/UNIDENTIFIED_CALLER|could not/i);
+    expect(text).toContain('TARGET_CONTEXT_UNRESOLVED');
     expect(swarmRunning()).toBe(false);
     expect(pendingWorkerSpawns()).toEqual([]);
   });
@@ -2500,13 +2551,14 @@ describe('through the MCP endpoint', () => {
     spawn({ workers: [{ task: 'second prime work' }], caller: { conversationId: 'c-prime-b' } });
 
     const requestId = 'wfr_dormant_worker_exact';
+    const executionSnapshot = await exactExecutionFor('c-worker-1');
     await recordChatObservations('c-worker-1', [
       { kind: 'turn_start', time: Date.now(), turnId: 't-dormant-exact' },
       {
         kind: 'tool_evidence',
         time: Date.now(),
         turnId: 't-dormant-exact',
-        calls: [{ messageId: 'm-dormant-exact', tool: 'read', order: 0, answered: false, requestId }]
+        calls: [{ messageId: 'm-dormant-exact', tool: 'read', order: 0, answered: false, requestId, executionSnapshot }]
       }
     ]);
     const reply = await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
@@ -2528,16 +2580,17 @@ describe('through the MCP endpoint', () => {
     await setEnabled(true, 3, true);
     const anonymous = await callTool('read', { paths: ['/anything'] });
     expect(anonymous).not.toContain('CALLER_IDENTITY_REQUIRED');
-    expect(anonymous).toMatch(REFUSED_ON_ROOTS);
+    expect(anonymous).toContain('TARGET_CONTEXT_UNRESOLVED');
 
     const requestId = 'wfr_retired_worker_allow_unattributed';
+    const executionSnapshot = await exactExecutionFor('c-retired-worker-policy');
     await recordChatObservations('c-retired-worker-policy', [
       { kind: 'turn_start', time: Date.now(), turnId: 't-retired-policy' },
       {
         kind: 'tool_evidence',
         time: Date.now(),
         turnId: 't-retired-policy',
-        calls: [{ messageId: 'm-retired-policy', tool: 'read', order: 0, answered: false, requestId }]
+        calls: [{ messageId: 'm-retired-policy', tool: 'read', order: 0, answered: false, requestId, executionSnapshot }]
       }
     ]);
     const exact = textOfReply(await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] }));
@@ -2560,8 +2613,9 @@ describe('through the MCP endpoint', () => {
     await setEnabled(true, 3, true);
     const allowed = await callTool('read', { paths: ['/anything'] });
     expect(allowed).not.toContain('CALLER_IDENTITY_REQUIRED');
-    // The ordinary sandbox now decides the call; no approved root was granted by this setting.
-    expect(allowed).toMatch(REFUSED_ON_ROOTS);
+    // Identity permission is not execution authority. With no exact input snapshot this stays
+    // fail-closed even when scheduled/headless unattributed calls are enabled.
+    expect(allowed).toContain('TARGET_CONTEXT_UNRESOLVED');
     expect(swarmRunning()).toBe(false);
 
     await setEnabled(true);
@@ -2575,8 +2629,7 @@ describe('through the MCP endpoint', () => {
     await setEnabled(true);
 
     expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
-    expect(text).toMatch(/relative.*no active folder/i);
-    expect(text).toContain('(none approved)');
+    expect(text).toContain('TARGET_CONTEXT_UNRESOLVED');
   });
 
   it.each([true, false])('unattributed shutdown reaches only the permitted command runtime (allowed=%s)', async allowed => {
@@ -2599,11 +2652,7 @@ describe('through the MCP endpoint', () => {
       const args = { cmd: 'shutdown.exe /s /t 0', workdir: '/probe' };
       const reply = await callTool('exec_command', args);
       if (allowed) {
-        expect(reply).toContain('shutdown intercepted');
-        expect(execution).toHaveBeenCalledWith(expect.objectContaining({ cwd: dir, hookCommand: args.cmd }));
-        execution.mockClear();
-        commandEnabled = false;
-        await callTool('exec_command', args);
+        expect(reply).toContain('TARGET_CONTEXT_UNRESOLVED');
         expect(execution).not.toHaveBeenCalled();
       } else {
         expect(reply).toContain('CALLER_IDENTITY_REQUIRED');
@@ -2877,6 +2926,9 @@ describe('through the MCP endpoint', () => {
     // The next call happens to be finish. Kernel acknowledgement runs after the handler so the
     // old finish planner still saw the offered row as unacked and wrote a false warning into the
     // final report, even though this exact call immediately marks that same row delivered.
+    // Keep the offer strictly earlier than the next call; equal millisecond timestamps are
+    // intentionally ambiguous and remain unacknowledged.
+    await new Promise((resolve) => setTimeout(resolve, 2));
     await asChat('c-worker-1', 'finish', { result: 'parser edge case included' });
     expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')?.pending).toBe(0);
     const report = offerMessagesForConversation(PRIME_CHAT)?.messages.find((message) =>
@@ -2958,6 +3010,9 @@ describe('through the MCP endpoint', () => {
     expect(withMessage).toContain('stop and check the parser first');
 
     // The next placed call is what retires it, so a lost result is re-offered.
+    // Offer acknowledgement deliberately requires the next call to start in a later clock tick;
+    // equal millisecond timestamps stay ambiguous and are re-offered by design.
+    await new Promise((resolve) => setTimeout(resolve, 2));
     const after = await asChat('c-worker-1', 'status');
     expect(after).not.toContain('stop and check the parser first');
     expect(pendingCount('worker-1')).toBe(0);
@@ -2983,13 +3038,14 @@ describe('through the MCP endpoint', () => {
       agentTools: true
     }));
     const requestId = `wfr_exec_held_${++evidenceSeq}`;
+    const executionSnapshot = await exactExecutionFor('c-worker-1');
     await recordChatObservations('c-worker-1', [
       { kind: 'turn_start', time: Date.now(), turnId: `t-held-${evidenceSeq}` },
       {
         kind: 'tool_evidence',
         time: Date.now(),
         turnId: `t-held-${evidenceSeq}`,
-        calls: [{ messageId: `m-held-${evidenceSeq}`, tool: 'exec_command', order: 0, answered: false, requestId }]
+        calls: [{ messageId: `m-held-${evidenceSeq}`, tool: 'exec_command', order: 0, answered: false, requestId, executionSnapshot }]
       }
     ]);
 

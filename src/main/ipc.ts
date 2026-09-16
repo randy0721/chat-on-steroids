@@ -1,5 +1,5 @@
 import { applyLoginStartup, supportsLoginStartup } from './window-lifecycle.js';
-import { prepareSessionPrompt } from './session/prompt.js';
+import { executionEnvironmentProjection, prepareSessionPrompt } from './session/prompt.js';
 import { noteChatOrigin } from './session/recorder.js';
 import { REASONING_EFFORTS } from '../shared/session.js';
 import { safeExternalLink } from '../shared/external-link.js';
@@ -21,6 +21,8 @@ import { requestBrowserPreferences } from './browser-preferences.js';
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser } from './session/start-input.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 import { registerPluginIpc } from './plugins-ipc.js';
+import { registerNodesIpc } from './nodes-ipc.js';
+import { executionTargetSchema } from '../shared/nodes.js';
 /**
  * IPC surface.
  *
@@ -410,6 +412,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return buildState();
   });
   registerPluginIpc(handle, getWindow);
+  registerNodesIpc(handle);
   handle('usage:get', () => usageOverview());
   handle('state:get', async () => {
     const state = await buildState();
@@ -856,9 +859,19 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return runTaskRequest(requestId ?? randomUUID(), JSON.stringify(['plan', text, backend]), signal => draftTaskPlan(text, backend, publish, signal), publish);
   });
   handle('sessions:send', async (payload) => {
-    const input = inputArgs.parse(payload);
+    const parsed = inputArgs.extend({
+      openingExecution: z.object({
+        nodeId: z.string().min(1).max(128),
+        workspace: z.string().min(1).max(32_768).nullable()
+      }).strict().optional(),
+      expectedExecutionTarget: executionTargetSchema.optional()
+    }).parse(payload);
+    const { openingExecution, expectedExecutionTarget, ...input } = parsed;
+    if (input.sessionId !== null && openingExecution) {
+      throw new Error('Execution target selection is only accepted when opening a new session');
+    }
     await validateInputImages(input.images ?? []);
-    return sendDesktopInput(input);
+    return sendDesktopInput(input, openingExecution, expectedExecutionTarget);
   });
   handle('sessions:outbox', async () => (await listInputs()).filter((row) => row.purpose !== 'decision'));
   handle('sessions:reorderInputs', async (payload) => {
@@ -1068,10 +1081,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       const mode = entry.automation ?? (control.enabled ? control.mode : 'off');
       const text = mode === 'goal' && goalBackendFor('goal') === 'templates' && !entry.text.includes(GOAL_MARKER_INSTRUCTION)
         ? entry.text + GOAL_MARKER_INSTRUCTION : entry.text;
+      const projection = await executionEnvironmentProjection(entry.executionSnapshot);
       // Only the opening user input owns executor setup. Existing chats, queued
-      // checkpoints and automatic continuations already have their instructions.
-      return !entry.sessionId && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish'
-        ? prepareSessionPrompt(text, entry, limits) : text;
+      // checkpoints and automatic continuations already have their base instructions, but each
+      // frozen delivery gets its own target projection so old paths/handles cannot masquerade as
+      // current authority after a later binding epoch.
+      return entry.opening === true && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish'
+        ? prepareSessionPrompt(text, entry, limits) : `${text}\n\n${projection}`;
     },
     applyAutomation: async (conversationId, automation, phase, objective, loopAfterTurn) => {
       // This message supersedes the old final; never pick that old final up merely

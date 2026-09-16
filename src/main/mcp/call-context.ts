@@ -14,6 +14,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AssetRef, FileChange, ToolOutcome } from '../../shared/session.js';
+import type { ExecutionSnapshot } from '../../shared/nodes.js';
 import type { OutputPublication, ProcessCompletion } from '../codex/unified-exec.js';
 
 export interface CallEvidence {
@@ -74,6 +75,11 @@ export interface CallContext {
   agent: string | null;
   /** Who this call was proven to be, for the broker tools to route by. */
   caller: CallCaller;
+  /**
+   * Exact frozen input target when request/input correlation has proved one. Nested code-mode
+   * calls inherit this field; handlers never select or rewrite it from model arguments.
+   */
+  execution?: ExecutionSnapshot | null;
   /**
    * Set by the tool guard, which is the only code that can tell a refusal apart from
    * a genuine failure — both come back to the model as an error result.

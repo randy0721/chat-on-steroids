@@ -4,8 +4,9 @@ import path from 'node:path';
 import { beforeAll, afterAll, afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
-import { initSessionStore, createSession, readEvents, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { initSessionStore, createSession, readEvents, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests, bindSessionExecutionTarget } from '../src/main/session/store.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { flushRecorder } from '../src/main/session/recorder.js';
 import { cancelInput, enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
 import { setChatBlocked, resetBlockedChatsForTests } from '../src/main/session/blocked-chats.js';
@@ -34,8 +35,13 @@ async function rpc(method: string, params: object, requestId?: string, surface: 
 async function identity() {
   const conversationId = randomUUID(), requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
   const session = await createSession({ conversationId, title: 'Code mode integration' });
-  expect(observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() })).toBe('stored');
-  return { conversationId, requestId, session };
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+  expect(observeRequestCorrelation({
+    requestId, conversationId, sessionId: session.id, userMessageId: randomUUID(), inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'exec', observedAt: Date.now()
+  })).toBe('stored');
+  return { conversationId, requestId, session, executionSnapshot };
 }
 const call = (requestId: string | undefined, code: string) => rpc('tools/call', { name: 'exec', arguments: { code } }, requestId);
 const text = (response: any) => response.result.content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('\n');
@@ -47,7 +53,10 @@ it('delivers one recovered-identity notice on the real structured MCP wire after
   expect(text(rejected)).toContain('Exact chat identity is required');
   const conversationId = randomUUID();
   const session = await createSession({ conversationId, title: 'Identity recovery wire' });
-  observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, messageId: randomUUID(), tool: 'update_plan', observedAt: Date.now() });
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+  observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, userMessageId: randomUUID(), inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'update_plan', observedAt: Date.now() });
   vi.spyOn(unifiedExecManager, 'execCommand').mockResolvedValue({ chunkId: 'fixture', wallTimeMs: 1,
     rawOutput: Buffer.from('command output'), truncationPolicy: { kind: 'tokens', tokens: 1000 },
     maxOutputTokens: undefined, processId: null, exitCode: 0, originalTokenCount: 2, outputOmittedBytes: null });
@@ -137,6 +146,9 @@ it('projects corrections for other Core structured results without changing the 
     const delivered = await status();
     expect(delivered.result.structuredContent).toEqual({ ...before.result.structuredContent, supplemental_context: expect.stringContaining('CORE_STATUS_CORRECTION') });
     expect(text(delivered).match(/CORE_STATUS_CORRECTION/g)).toHaveLength(1);
+    // Receipt is proven only by a strictly later call; keep the test independent of two RPCs
+    // sharing one millisecond on a fast suite run.
+    await new Promise(resolve => setTimeout(resolve, 1));
     expect((await status()).result.structuredContent).toEqual(before.result.structuredContent);
   } finally {
     await status();
@@ -189,7 +201,10 @@ it('initializes, discovers and executes the actual model-facing MCP contract wit
   expect(contexts).toHaveLength(2);
   expect(contexts[0]).not.toBe(contexts[1]);
   expect(contexts[0]!.evidence).not.toBe(contexts[1]!.evidence);
-  for (const context of contexts) expect(context!.caller).toMatchObject({ requestId: who.requestId, conversationId: who.conversationId, sessionId: who.session.id });
+  for (const context of contexts) {
+    expect(context!.caller).toMatchObject({ requestId: who.requestId, conversationId: who.conversationId, sessionId: who.session.id });
+    expect(context!.execution).toEqual(who.executionSnapshot);
+  }
   const events = (await readEvents(who.session.id)).filter(event => event.kind === 'tool_call');
   expect(events.map(event => event.call.tool).sort()).toEqual(['exec', 'read', 'read']);
   expect(new Set(events.map(event => event.call.callId)).size).toBe(3);
@@ -292,23 +307,13 @@ it('rejects missing proof, foreign tools, invalid child arguments and nested lif
   }
 });
 
-it('allows unattributed file edits through code mode while preserving permissions and chat-owned operations', async () => {
+it('allows unattributed code mode itself but refuses computer children without frozen execution authority', async () => {
   const patch = '*** Begin Patch\n*** Add File: /workspace/unattributed.txt\n+created anonymously\n*** End Patch';
   const response = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(patch)}}));`);
   expect(response.result.isError, text(response)).not.toBe(true);
-  expect(JSON.parse(text(response)).isError).not.toBe(true);
-  expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('created anonymously\n');
-  const read = await call(`wfr_${randomUUID().replaceAll('-', '')}`, 'text(await tools.read({paths:["/workspace/unattributed.txt"]}));');
-  expect(text(read)).toContain('created anonymously');
-  const edit = '*** Begin Patch\n*** Update File: /workspace/unattributed.txt\n@@\n-created anonymously\n+edited anonymously\n*** End Patch';
-  const edited = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(edit)}}));`);
-  expect(JSON.parse(text(edited)).isError).not.toBe(true);
-  expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
-  ctx.caps = { ...ctx.caps, edit: false };
-  const deniedPatch = edit.replace('-created anonymously', '-edited anonymously').replace('+edited anonymously', '+must not change');
-  const denied = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(deniedPatch)}}));`);
-  expect(JSON.parse(text(denied)).isError).toBe(true);
-  expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
+  expect(JSON.parse(text(response))).toMatchObject({ isError: true });
+  expect(text(response)).toContain('TARGET_CONTEXT_UNRESOLVED');
+  await expect(fs.stat(path.join(directory, 'unattributed.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   const plan = await call(undefined, 'text(await tools.update_plan({plan:[{step:"Anonymous plan",status:"in_progress"}]}));');
   expect(JSON.parse(text(plan)).isError).toBe(true);
   const finish = await rpc('tools/call', { name: 'session_finish', arguments: { summary: 'done' } });
@@ -319,10 +324,20 @@ it('allows unattributed file edits through code mode while preserving permission
     await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: true } });
     const spawn = await call(undefined, 'text(await tools.agents({action:"spawn",workers:[{task:"Must never start"}]}));');
     expect(JSON.parse(text(spawn)).isError).toBe(true);
-    expect(text(spawn)).toContain('UNIDENTIFIED_CALLER');
+    expect(text(spawn)).toContain('TARGET_CONTEXT_UNRESOLVED');
   } finally {
     await saveConfig(config);
   }
+});
+
+it('fences a direct computer handler when the session binding epoch changed after the input snapshot', async () => {
+  const who = await identity();
+  await bindSessionExecutionTarget(who.session.id, { nodeId: 'local', workspace: null, nodeConfigVersion: 1 });
+  const handler = vi.spyOn(backend, 'readTextFile');
+  const response = await rpc('tools/call', { name: 'read', arguments: { paths: ['/workspace/alpha.txt'] } }, who.requestId);
+  expect(response.result.isError).toBe(true);
+  expect(text(response)).toContain('TARGET_CHANGED');
+  expect(handler).not.toHaveBeenCalled();
 });
 
 it('rechecks live permissions and approved roots between awaited children', async () => {
@@ -390,7 +405,10 @@ it('uses existing process custody for nested exec and write_stdin across a conve
   expect(text(denied)).toContain('not proven to belong to this durable');
   const replacement = randomUUID(), requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
   expect(await rebindSession(a.session.id, a.conversationId, replacement)).toBe(true);
-  observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(a.session.executionTarget!, a.session.id, inputId);
+  observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, userMessageId: randomUUID(), inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
   const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"owner\\r",yield_time_ms:1000}));`);
   expect(text(continued)).toContain('OWNED_RESULT');
 });

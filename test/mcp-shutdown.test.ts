@@ -2,12 +2,15 @@ import { promises as fs } from 'node:fs';
 import * as filesystem from '../src/main/codex/filesystem.js';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
-import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { createSession, initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
 
 let dir = '';
 let endpoint: McpEndpoint | null = null;
@@ -45,6 +48,15 @@ it('drains an accepted MCP mutation before closing its response socket', async (
     sessionTools: false,
     agentTools: false
   }));
+  const conversationId = randomUUID();
+  const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+  const session = await createSession({ conversationId, title: 'MCP shutdown mutation fixture' });
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+  expect(observeRequestCorrelation({
+    requestId, conversationId, sessionId: session.id, inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'apply_patch', observedAt: Date.now()
+  })).toBe('stored');
   const body = {
     jsonrpc: '2.0',
     id: 1,
@@ -73,7 +85,7 @@ it('drains an accepted MCP mutation before closing its response socket', async (
   });
   const request = fetch(endpoint.url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'x-request-id': requestId },
     body: JSON.stringify(body)
   }).then(async (response) => ({ status: response.status, text: await response.text() }));
   let stopping: Promise<void> | undefined;

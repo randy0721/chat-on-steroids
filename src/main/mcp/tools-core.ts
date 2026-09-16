@@ -178,6 +178,8 @@ const int32Number = z
   .number()
   .refine((value) => Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647);
 const unsignedIntegerNumber = z.number().refine((value) => Number.isSafeInteger(value) && value >= 0);
+const opaqueRemoteProcessHandle = z.string().min(4).max(256).regex(/^nh_[A-Za-z0-9_-]+$/);
+const processSessionId = z.union([int32Number, opaqueRemoteProcessHandle]);
 const excludeFolderPattern = z
   .string()
   .min(1)
@@ -194,10 +196,9 @@ const unifiedExecOutputSchema = z
     chunk_id: z.string().optional().describe('Output chunk identifier.'),
     wall_time_seconds: z.number().describe('Seconds spent waiting for output.'),
     exit_code: z.number().optional().describe('Process exit code when the command finished during this call.'),
-    session_id: z
-      .number()
+    session_id: processSessionId
       .optional()
-      .describe('Session identifier to pass to write_stdin when the process is still running.'),
+      .describe('Session identifier to pass to write_stdin when the process is still running. Remote nodes use an opaque nh_* handle.'),
     original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
     output: z.string().describe('Command output text, possibly truncated.'),
     supplemental_context: z.string().optional().describe('App context, not process output.')
@@ -926,7 +927,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         description: WRITE_STDIN_DESCRIPTION,
         inputSchema: z
           .object({
-            session_id: int32Number.describe(WRITE_STDIN_SESSION_ID_DESCRIPTION),
+            session_id: processSessionId.describe(`${WRITE_STDIN_SESSION_ID_DESCRIPTION} Remote nodes return an opaque nh_* handle; pass it back unchanged.`),
             chars: z.string().optional().describe(WRITE_STDIN_CHARS_DESCRIPTION),
             yield_time_ms: unsignedIntegerNumber.optional().describe(WRITE_STDIN_YIELD_TIME_DESCRIPTION),
             max_output_tokens: unsignedIntegerNumber.optional().describe(MAX_OUTPUT_TOKENS_DESCRIPTION)
@@ -936,6 +937,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       })),
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
+          if (typeof input.session_id !== 'number') {
+            return fail('HANDLE_EXPIRED: this opaque process handle belongs to a remote execution epoch and cannot be used by the local executor. No process was touched.');
+          }
           // A session id is a small integer that means nothing outside the chat that was given
           // it, and every chat reaches the same manager here. Refuse only what is proven to
           // belong elsewhere; an unproven caller keeps working exactly as before.

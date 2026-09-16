@@ -2829,6 +2829,36 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .chat-error-next { margin: 8px 0 0; font-size: 13px; line-height: 1.5; color: var(--soft); }
 
 .settings-section-title { margin: 34px 0 14px; font-size: 14px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--ink); }
+.remote-nodes-list { display: grid; gap: 0; }
+.remote-node-row { display: flex; align-items: center; gap: 16px; padding: 14px 2px; border-top: 1px solid var(--line); }
+.remote-node-copy { display: grid; flex: 1; min-width: 0; gap: 4px; }
+.remote-node-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.remote-node-heading b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 550; }
+.remote-node-status { flex: 0 0 auto; padding: 2px 7px; border-radius: var(--pill); background: var(--wash); color: var(--soft); font-size: 10px; }
+.remote-node-status.is-connected { background: var(--green-wash); color: var(--green); }
+.remote-node-status.is-error { background: var(--red-wash); color: var(--red); }
+.remote-node-endpoint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--soft); font-size: 11px; }
+.remote-node-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.remote-node-actions .btn { padding: 5px 8px; font-size: 10.5px; }
+.remote-nodes-empty { margin: 10px 2px 4px; }
+.remote-node-editor { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 16px 2px 4px; border-top: 1px solid var(--line); }
+.remote-node-editor[hidden] { display: none; }
+.remote-node-editor label { display: grid; gap: 5px; color: var(--soft); font-size: 11px; }
+.remote-node-editor input { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--edge); border-radius: var(--r-xs); background: var(--sunk); color: var(--ink); font: inherit; }
+.remote-node-editor-actions { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; }
+#nodeMenu > summary { max-width: 170px; }
+#nodeMenu > summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#nodeMenu .composer-popover { width: 330px; }
+#nodeMenu .composer-popover label { display: grid; align-items: stretch; gap: 6px; padding: 8px 9px; color: var(--soft); font-size: 11px; }
+#nodeMenu .composer-popover select, #nodeMenu .composer-popover input { width: 100%; max-width: none; min-width: 0; padding: 7px 8px; border: 1px solid var(--edge); border-radius: var(--r-xs); background: var(--sunk); color: var(--ink); font: inherit; }
+#composerNodeStatus { margin: 6px 9px 8px; }
+#nodeMenu .node-rebind { width: calc(100% - 18px); margin: 0 9px 8px; justify-content: center; }
+@media (max-width: 720px) {
+  .remote-node-row { align-items: flex-start; flex-direction: column; }
+  .remote-node-actions { justify-content: flex-start; }
+  .remote-node-editor { grid-template-columns: minmax(0, 1fr); }
+  .remote-node-editor-actions { grid-column: 1; }
+}
 .composer-popover .muted { margin: 6px 9px; font-size: 11px; line-height: 1.5; }
 
 .message-attachments { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; max-width: 100%; }

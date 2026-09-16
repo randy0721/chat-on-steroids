@@ -1,6 +1,10 @@
 /**
  * Preparing and publishing a handoff.
  *
+ * A handoff is model context only. Execution-node identity, binding epochs and runtime-instance
+ * evidence stay with the durable session / frozen input snapshot and are never serialized into
+ * the prose a replacement chat receives.
+ *
  * One store, one writer: the ChatGPT conversation being compacted writes its own brief as
  * its final answer, and this is where that brief is saved. The id is minted here rather
  * than taken from the text — a model that invents its own handoff id can collide with a

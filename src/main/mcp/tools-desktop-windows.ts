@@ -8,6 +8,7 @@ import { getConfig } from '../config.js';
 import { fail, type SurfaceRegistrar, type ToolContent, type ToolResult } from './kernel.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 import { toolDeclaration } from './tool-declarations.js';
+import { LOCAL_NODE_ID } from '../../shared/nodes.js';
 
 const READ_METHODS = new Set<string>(WINDOWS_COMPUTER_READ_METHODS);
 const STATE_INPUT_METHODS = new Set<string>(WINDOWS_COMPUTER_STATE_INPUT_METHODS);
@@ -100,6 +101,10 @@ export function registerWindowsDesktopTools(reg: SurfaceRegistrar): void {
       inputSchema: WINDOWS_API_SCHEMAS[method],
       annotations: { readOnlyHint: read, destructiveHint: !read, idempotentHint: read, openWorldHint: true }
     }), 'windows'), input => reg.guarded(capability, method, async () => {
+      const execution = currentCall()?.execution;
+      if (process.platform !== 'win32' && execution?.nodeId === LOCAL_NODE_ID) {
+        return fail('CAPABILITY_UNAVAILABLE: Windows desktop methods require a Windows execution node; no local desktop action ran.');
+      }
       // The schema is checked by the same registrar for direct calls and code-mode children.
       if (method === 'type_text' && 'text' in input && /[\r\n]/.test(String(input.text)) && !reg.caps.clipboardWrite) {
         return fail('TOOL_DISABLED: multiline text needs the existing Replace clipboard text permission. No input ran.');
@@ -121,6 +126,10 @@ export function registerWindowsDesktopTools(reg: SurfaceRegistrar): void {
     description: 'Read this computer’s clipboard text.', inputSchema: z.object({}).strict(),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   })), () => reg.guarded('clipboardRead', 'read_clipboard', async () => {
+    const execution = currentCall()?.execution;
+    if (process.platform !== 'win32' && execution?.nodeId === LOCAL_NODE_ID) {
+      return fail('CAPABILITY_UNAVAILABLE: Windows clipboard methods require a Windows execution node; no local clipboard action ran.');
+    }
     const value = (await act([{ type: 'read_clipboard' }])).clipboard[0] ?? '';
     if (value.length > 64_000) throw new ComputerError('CLIPBOARD_TOO_LARGE: clipboard text exceeds the response limit.');
     return desktopResult('read_clipboard', value);
@@ -129,6 +138,10 @@ export function registerWindowsDesktopTools(reg: SurfaceRegistrar): void {
     description: 'Replace this computer’s clipboard text.', inputSchema: z.object({ text: z.string().max(100_000) }).strict(),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }
   })), input => reg.guarded('clipboardWrite', 'write_clipboard', async () => {
+    const execution = currentCall()?.execution;
+    if (process.platform !== 'win32' && execution?.nodeId === LOCAL_NODE_ID) {
+      return fail('CAPABILITY_UNAVAILABLE: Windows clipboard methods require a Windows execution node; no local clipboard action ran.');
+    }
     await act([{ type: 'write_clipboard', text: input.text }]);
     return { content: [{ type: 'text', text: 'Clipboard text replaced.' }], structuredContent: { value: null } };
   }));

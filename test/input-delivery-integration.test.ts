@@ -30,8 +30,9 @@ vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => '
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
-const { createSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
+const { bindSessionExecutionTarget, createSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { registerIpc } = await import('../src/main/ipc.js');
+const { executionEnvironmentProjection } = await import('../src/main/session/prompt.js');
 const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
 const input = await import('../src/main/session/input.js');
 const goal = await import('../src/main/goal.js');
@@ -452,7 +453,8 @@ it.each([
         { kind: 'turn_end', turnId: 'silent-source', outcome: 'completed', time: now }
       ] });
       const ready = await post('/input/claim', { id: manual.id, owner: 'finished-page', conversationId, requiresAuthorization: true });
-      expect(ready.body.input?.text).toBe(manual.text);
+      expect(ready.body.input?.text).toBe(await projectedDelivery(manual, manual.text));
+      expect((await input.listInputs()).find(row => row.id === manual.id)?.text).toBe(manual.text);
       expect((await post('/goal/draft', { conversationId, turnId: 'silent-source', terminalRequired: true })).status).toBe(409);
       now += model === 'gpt-6-pro' ? 600001 : 120001;
       await bridge.sweepStaleSwarm(now);
@@ -500,6 +502,17 @@ it.each([
     expect(messages.filter(event => event.kind === 'user_message' && event.messageId === 'combined-user')).toHaveLength(1);
     expect(messages.find(event => event.kind === 'user_message' && event.messageId === 'combined-user')).toMatchObject({
       authoredText: expect.stringContaining(checkpoint.text), attachments: [attachment], message: { text: expect.stringContaining(manual.text) }
+    });
+    const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+    const correlated = await post('/correlations', { conversationId, calls: [{
+      requestId, messageId: 'combined-connector-call', tool: 'read', order: 0, answered: false,
+      userMessageId: 'combined-user'
+    }] });
+    expect(correlated.body).toMatchObject({ confirmed: [requestId], conflicts: [], complete: true });
+    const { requestCorrelation } = await import('../src/main/session/correlation.js');
+    expect(requestCorrelation(requestId)).toMatchObject({
+      inputId: manual.id,
+      executionSnapshot: { inputId: manual.id, sessionId: session.id, nodeId: 'local' }
     });
     expect((await post('/goal/draft', { conversationId, turnId: 'silent-source', terminalRequired: true })).status).toBe(409);
   } finally { clock.mockRestore(); }
@@ -1009,8 +1022,16 @@ afterAll(async () => {
   await removeTempDir(directory);
 });
 const message = (sessionId: string | null, automation: 'off' | 'goal' | 'loop') => ({
-  id: randomUUID(), sessionId, automation, text: 'Complete this request', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null
+  id: randomUUID(), sessionId, automation, text: 'Complete this request', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null,
+  ...(sessionId ? { expectedExecutionTarget: { nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 } } : { openingExecution: { nodeId: 'local', workspace: null } })
 });
+async function projectedDelivery(
+  entry: { executionSnapshot?: import('../src/shared/nodes.js').ExecutionSnapshot },
+  text: string
+): Promise<string> {
+  if (!entry.executionSnapshot) throw new Error('test requires a frozen execution snapshot');
+  return `${text}\n\n${await executionEnvironmentProjection(entry.executionSnapshot)}`;
+}
 it('freezes the complete current prompt for each new chat and leaves the authored input intact', async () => {
   const config = defaultConfig();
   const standing = 'ä 🐱 Complete standing guidance\n'.repeat(100) + 'FINAL_STANDING_MARKER';
@@ -1034,8 +1055,17 @@ it.each(['off', 'goal', 'loop'] as const)('does not repeat setup in an existing 
   const conversationId = randomUUID();
   const session = await createSession({ title: 'Existing executor', conversationId });
   const row = await input.enqueueInput({ ...message(session.id, automation), mode: 'auto', text: 'Continue the original work' });
+  const expected = await projectedDelivery(row, row.text);
+  await bindSessionExecutionTarget(session.id, {
+    nodeId: 'later-selected-windows', workspace: 'C:\\later\\workspace', nodeConfigVersion: 900
+  });
   const claim = await input.claimBrowserInput(row.id, 'followup-page', conversationId, true);
-  expect(claim?.text).toBe('Continue the original work');
+  expect(claim?.text).toBe(expected);
+  expect(claim?.text).not.toContain('later-selected-windows');
+  expect(claim?.text).not.toContain('COS_CONTEXT');
+  expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+    text: 'Continue the original work', executionSnapshot: row.executionSnapshot
+  });
   input.resetInputForTests();
   expect((await input.claimBrowserInput(row.id, 'followup-page', conversationId, true))?.text).toBe(claim?.text);
 });
@@ -1072,13 +1102,19 @@ it('delivers only the selected project AGENTS.md, freezes claims across restart,
   const tool = await input.offerToolInput(session.id, session.conversationId, 'project-tool-call', Date.now());
   expect(tool.messages).toHaveLength(1);
   expect(tool.messages[0]!.text).not.toMatch(/PROJECT_CHANGED|COS_CONTEXT/);
-  expect((await input.listInputs()).find(row => row.id === followup.id)!.deliveryText).toBe(followup.text);
+  const deliveredFollowup = (await input.listInputs()).find(row => row.id === followup.id)!;
+  expect(deliveredFollowup.text).toBe(followup.text);
+  expect(deliveredFollowup.deliveryText).toBe(await projectedDelivery(followup, followup.text));
 });
 it.each(['finish', 'after-turn'] as const)('wakes browser delivery after a committed final makes %s input eligible', async mode => {
   const conversationId = randomUUID();
   const session = await createSession({ title: 'Final-boundary wake', conversationId });
   await post('/events', { conversationId, events: [{ kind: 'turn_start', turnId: 'wake-turn', time: Date.now() }] });
   const queued = await input.enqueueInput({ ...message(session.id, 'off'), mode });
+  const expected = await projectedDelivery(queued, queued.text);
+  await bindSessionExecutionTarget(session.id, {
+    nodeId: 'ui-selected-after-queue', workspace: 'D:\\other\\workspace', nodeConfigVersion: 901
+  });
   expect(await input.pendingBrowserInputs()).toEqual([]);
   const snapshots: ReturnType<typeof input.pendingBrowserInputs>[] = [];
   const wake = vi.spyOn(browserWake, 'wakeBrowserWork').mockImplementation(() => { snapshots.push(input.pendingBrowserInputs()); });
@@ -1090,7 +1126,9 @@ it.each(['finish', 'after-turn'] as const)('wakes browser delivery after a commi
     // The notification only prompts a read: it must not consume or claim input.
     expect((await input.listInputs()).find(row => row.id === queued.id)?.state).toBe('queued');
     const claim = await input.claimBrowserInput(queued.id, 'checkpoint-page', conversationId, true);
-    expect(claim?.text).toBe(queued.text);
+    expect(claim?.text).toBe(expected);
+    expect(claim?.text).not.toContain('ui-selected-after-queue');
+    expect((await input.listInputs()).find(row => row.id === queued.id)?.text).toBe(queued.text);
   } finally { wake.mockRestore(); }
 });
 describe('IPC input delivery and Goal control integration', () => {
@@ -1118,8 +1156,9 @@ describe('IPC input delivery and Goal control integration', () => {
     await input.cancelInput(sol.id);
     const chat = await createSession({ title: 'Existing native chat', conversationId: randomUUID() });
     const later = message(chat.id, 'off');
-    await input.enqueueInput(later as Parameters<typeof input.enqueueInput>[0]);
-    expect((await input.claimBrowserInput(later.id, 'later', chat.conversationId))!.text).toBe(later.text);
+    const laterEntry = await input.enqueueInput(later as Parameters<typeof input.enqueueInput>[0]);
+    expect((await input.claimBrowserInput(later.id, 'later', chat.conversationId))!.text)
+      .toBe(await projectedDelivery(laterEntry, later.text));
     await input.cancelInput(later.id);
   });
   it('requires an exact plugin claim and matching schema before a refresh completion', async () => {
@@ -1194,7 +1233,10 @@ describe('IPC input delivery and Goal control integration', () => {
     }
     const rows = (await readEvents(session.id)).filter(event => event.kind === 'user_message');
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ inputId: authored.id, authoredText: authored.text, message: { text: authored.text } });
+    const delivered = (await input.listInputs()).find(row => row.id === authored.id)!;
+    expect(delivered.text).toBe(authored.text);
+    expect(delivered.deliveryText).toBe(await projectedDelivery(delivered, authored.text));
+    expect(rows[0]).toMatchObject({ inputId: authored.id, authoredText: authored.text, message: { text: delivered.deliveryText } });
     const assetId = rows[0]!.kind === 'user_message' ? rows[0]!.assets![0]!.id : '';
     expect((await handlers.get('sessions:image')!(null, { id: session.id, assetId })).data).toBe(dataUrl);
     expect((await input.listInputs()).find(row => row.id === authored.id)?.historyRecorded).toBe(true);
@@ -1364,18 +1406,79 @@ describe('IPC input delivery and Goal control integration', () => {
     await input.offerToolInput(session.id, conversationId, 'overlapping-request', 0);
     expect(goal.goalSwitchFor(conversationId).enabled).toBe(false);
   });
+  it('joins a late exact user anchor and ACK to the frozen UI input before admitting computer tools', async () => {
+    const { requestCorrelation } = await import('../src/main/session/correlation.js');
+    const { dispatch, ok } = await import('../src/main/mcp/kernel.js');
+    const { currentCall } = await import('../src/main/mcp/call-context.js');
+    const conversationId = randomUUID();
+    const session = await createSession({ conversationId });
+    const authored = message(session.id, 'off');
+    const sent = await handlers.get('sessions:send')!(null, authored);
+    expect(sent).toMatchObject({ ok: true });
+    const frozen = sent.data.executionSnapshot;
+    expect(frozen).toMatchObject({ inputId: authored.id, sessionId: session.id, nodeId: 'local' });
+    expect((await post('/input/claim', { id: authored.id, owner: 'proof-page', conversationId })).body.input).toBeTruthy();
+    const requestId = `wfr_${randomUUID()}`;
+    const evidence = { requestId, messageId: 'assistant-proof', tool: 'read', order: 0, answered: false };
+    await post('/correlations', { conversationId, calls: [evidence] });
+    expect(requestCorrelation(requestId)?.executionSnapshot).toBeUndefined();
+    const ran = vi.fn(async () => {
+      expect(currentCall()?.execution).toEqual(frozen);
+      return ok('exact frozen target');
+    });
+    const pending = dispatch('read', {}, null, requestId, 'core', ran);
+    await post('/correlations', { conversationId, calls: [{ ...evidence, userMessageId: 'provider-proof-user' }] });
+    expect(requestCorrelation(requestId)?.userMessageId).toBe('provider-proof-user');
+    expect(ran).not.toHaveBeenCalled();
+    await post('/input/ack', { id: authored.id, owner: 'proof-page', conversationId, messageId: 'provider-proof-user' });
+    expect((await pending).isError).not.toBe(true);
+    expect(ran).toHaveBeenCalledOnce();
+    expect(requestCorrelation(requestId)?.executionSnapshot).toEqual(frozen);
+    expect((await dispatch('exec_command', {}, null, requestId, 'core', ran)).isError).not.toBe(true);
+    expect((await dispatch('get_window_state', {}, null, requestId, 'desktop', ran)).isError).not.toBe(true);
+    expect((await input.listInputs()).find(row => row.id === authored.id)?.executionSnapshot).toEqual(frozen);
+  });
+
+  it('blocks an observed old extension protocol before desktop send and accepts a refreshed peer', async () => {
+    const hello = async (protocol: number) => fetch(`http://127.0.0.1:${bridgePort()}/hello`, {
+      headers: { 'x-extension-version': APP_VERSION, 'x-extension-protocol': String(protocol) }
+    });
+    try {
+      await hello(BRIDGE_PROTOCOL - 1);
+      const reply = await handlers.get('sessions:send')!(null, message(null, 'off'));
+      expect(reply).toMatchObject({ ok: false, error: expect.stringContaining('execution-proof protocol is incompatible') });
+      expect(await input.listInputs()).toEqual([]);
+    } finally { await hello(BRIDGE_PROTOCOL); }
+    expect((await handlers.get('sessions:send')!(null, message(null, 'off'))).ok).toBe(true);
+  });
+
+  it('rejects missing and stale UI bindings before publishing a desktop input', async () => {
+    const session = await createSession({ conversationId: randomUUID() });
+    const missing: Record<string, unknown> = { ...message(session.id, 'off') };
+    delete missing.expectedExecutionTarget;
+    const refused = await handlers.get('sessions:send')!(null, missing);
+    expect(refused).toMatchObject({ ok: false, error: expect.stringContaining('TARGET_CONTEXT_UNRESOLVED') });
+    const stale = message(session.id, 'off');
+    await bindSessionExecutionTarget(session.id, { nodeId: 'local', workspace: null, nodeConfigVersion: 1 });
+    expect(await handlers.get('sessions:send')!(null, stale)).toMatchObject({ ok: false, error: expect.stringContaining('TARGET_CHANGED') });
+    expect(await input.listInputs()).toEqual([]);
+  });
+
   it('binds a new chat through HTTP ACK, applies its choice once, and pushes session change', async () => {
     const request = message(null, 'goal');
-    await handlers.get('sessions:send')!(null, request);
+    const started = await handlers.get('sessions:send')!(null, request);
+    expect(started.data).toMatchObject({ sessionId: expect.any(String), opening: true,
+      executionSnapshot: { sessionId: expect.any(String), inputId: request.id, nodeId: 'local' } });
+    const openingSessionId = started.data.sessionId as string;
     const claim = await post('/input/claim', { id: request.id, owner: 'document-owner', conversationId: null });
     expect(claim.body.input.automation).toBe('goal');
     const conversationId = randomUUID();
-    const session = await createSession({ title: 'New input', conversationId });
     pushed.mockClear();
-    const payload = { id: request.id, owner: 'document-owner', conversationId };
+    const payload = { id: request.id, owner: 'document-owner', conversationId, messageId: 'opening-user-message' };
     expect((await post('/input/ack', payload)).body.ok).toBe(true);
     expect(goal.goalSwitchFor(conversationId)).toMatchObject({ enabled: true, mode: 'goal' });
-    expect((await input.listInputs()).find(row => row.id === request.id)?.deliveredSessionId).toBe(session.id);
+    expect((await input.listInputs()).find(row => row.id === request.id)?.deliveredSessionId).toBe(openingSessionId);
+    expect((await (await import('../src/main/session/store.js')).getSession(openingSessionId))?.conversationId).toBe(conversationId);
     expect(pushed).toHaveBeenCalledWith('session:changed');
     await goal.setGoalSwitchNow(conversationId, 'goal', false);
     expect((await post('/input/ack', payload)).body.ok).toBe(true);
@@ -1384,16 +1487,54 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await post('/input/ack', { ...payload, conversationId: wrong })).status).toBe(409);
     expect(goal.goalSwitchFor(wrong).own).toBe(false);
   });
+  it('refuses request correlation before a fresh opening ACK instead of minting a competing session', async () => {
+    const request = message(null, 'off');
+    const started = await handlers.get('sessions:send')!(null, request);
+    const openingSessionId = started.data.sessionId as string;
+    expect(openingSessionId).toBeTruthy();
+    expect((await post('/input/claim', { id: request.id, owner: 'opening-race-page', conversationId: null })).body.input)
+      .toBeTruthy();
+    const conversationId = randomUUID();
+    const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+    const evidence = { conversationId, calls: [{
+      requestId, messageId: 'opening-race-connector', tool: 'read', order: 0, answered: false,
+      userMessageId: 'opening-race-user'
+    }] };
+    const earlyEvents = await post('/events', { conversationId, events: [{
+      kind: 'user_message', messageId: 'opening-race-user', text: request.text, time: Date.now()
+    }] });
+    expect(earlyEvents).toMatchObject({ status: 409, body: { error: 'opening_session_pending' } });
+    const early = await post('/correlations', evidence);
+    expect(early).toMatchObject({ status: 409, body: { error: 'opening_session_pending' } });
+    const store = await import('../src/main/session/store.js');
+    expect(await store.findSessionByConversation(conversationId, { requireUnique: true })).toBeNull();
+
+    expect((await post('/input/ack', {
+      id: request.id, owner: 'opening-race-page', conversationId, messageId: 'opening-race-user'
+    })).body.ok).toBe(true);
+    expect((await store.getSession(openingSessionId))?.conversationId).toBe(conversationId);
+    expect((await post('/events', { conversationId, events: [{
+      kind: 'user_message', messageId: 'opening-race-user', text: request.text, time: Date.now()
+    }] })).status).toBe(200);
+    const retry = await post('/correlations', evidence);
+    expect(retry.body).toMatchObject({ confirmed: [requestId], conflicts: [], complete: true, sessionId: openingSessionId });
+    const { requestCorrelation } = await import('../src/main/session/correlation.js');
+    expect(requestCorrelation(requestId)).toMatchObject({
+      sessionId: openingSessionId,
+      inputId: request.id,
+      executionSnapshot: { sessionId: openingSessionId, inputId: request.id, nodeId: 'local' }
+    });
+  });
   it('retains the opening objective when Off wins before ACK and never overwrites later edits on a mode change', async () => {
     const objective = 'Keep this opening objective while switched off';
     const request = { ...message(null, 'goal'), objective };
-    await handlers.get('sessions:send')!(null, request);
+    const started = await handlers.get('sessions:send')!(null, request);
     await post('/input/claim', { id: request.id, owner: 'off-before-ack', conversationId: null });
     expect(await input.setInputAutomation(request.id, 'off')).toBe(true);
     const conversationId = randomUUID();
-    await createSession({ title: 'Off before first receipt', conversationId });
     const ack = { id: request.id, owner: 'off-before-ack', conversationId };
     expect((await post('/input/ack', ack)).body.ok).toBe(true);
+    expect((await (await import('../src/main/session/store.js')).getSession(started.data.sessionId))?.conversationId).toBe(conversationId);
     expect(goal.goalObjectiveFor(conversationId)).toBe(objective);
     expect(goal.goalSwitchFor(conversationId)).toMatchObject({ own: true, enabled: false });
     expect(goal.goalArmedFor(conversationId)).toBe(false);
@@ -1419,9 +1560,9 @@ it.each(['auto', 'finish'] as const)('adds one short reminder to every later Ast
     { kind: 'turn_end', turnId: 'previous-astra', outcome: 'completed', time: t + 1000 }
   ] });
   const request = { ...message(chat.id, 'off'), mode, afterTurn: true } as Parameters<typeof input.enqueueInput>[0];
-  await input.enqueueInput(request);
+  const row = await input.enqueueInput(request);
   const claimed = await input.claimBrowserInput(request.id, 'later-page', conversationId, true);
-  expect(claimed!.text).toBe(request.text + '\n\n' + finishInstruction(3));
+  expect(claimed!.text).toBe(await projectedDelivery(row, request.text + '\n\n' + finishInstruction(3)));
   expect(claimed?.text).not.toContain('The user just sent');
   input.resetInputForTests();
   const restored = (await input.listInputs()).find(row => row.id === request.id)!;

@@ -16,6 +16,7 @@ import { renderRecoveryCountdowns } from './recovery.js';
 import type { RecoveryCountdown } from '../shared/recovery.js';
 import { communicationTitle, foldAgentCommunication } from './agent-communication.js';
 import { initContextMeter, paintContextMeter } from './context-meter.js';
+import { initNodes, composerExecutionSelection, setComposerNodeContext } from './nodes.js';
 import { isAstraModel, isProModel } from '../shared/chat-models.js';
 import type { InputImage, InputAttachment, InputAutomation } from '../shared/input.js';
 import { injectableAttachments } from '../shared/input.js';
@@ -872,7 +873,7 @@ function paintActiveGoal(): void {
       $<HTMLTextAreaElement>('sessionObjective').focus();
     }));
 }
-type TaskPlanDraft = { text: string; requestId: string | null; stages: string[] | null; sending: boolean; progress: TaskProgress | null; error: string | null };
+type TaskPlanDraft = { executionSelection?: NonNullable<ReturnType<typeof composerExecutionSelection>>; text: string; requestId: string | null; stages: string[] | null; sending: boolean; progress: TaskProgress | null; error: string | null };
 // Planning belongs to its draft key. Completed stages own their captured objective
 // independently of composer edits; existing sessions hand them to the durable queue.
 const taskPlans = new Map<string, TaskPlanDraft>();
@@ -911,7 +912,9 @@ async function createTaskPlan(backend: 'api' | 'chatgpt'): Promise<void> {
   cancelTaskPlan(key);
   const sessionId = selectedId, projectId = selectedId ? sessions.find(row => row.id === selectedId)?.projectId ?? null : selectedProjectId;
   const requestId = text ? crypto.randomUUID() : null;
-  const plan: TaskPlanDraft = { text, requestId, stages: null, sending: false, progress: null, error: null };
+  const executionSelection = sessionId ? composerExecutionSelection(sessionId) : undefined;
+  if (sessionId && !executionSelection) return;
+  const plan: TaskPlanDraft = { ...(executionSelection ? { executionSelection } : {}), text, requestId, stages: null, sending: false, progress: null, error: null };
   taskPlans.set(key, plan); paintTaskPlan();
   if (!requestId) { input.focus(); return; }
   const current = () => taskPlans.get(key) === plan;
@@ -998,11 +1001,13 @@ async function queuePreparedPlan(key: string, plan: TaskPlanDraft & { stages: st
   if (!stages.length || stages.some(stage => !stage) || JSON.stringify(stages).length > 12000) {
     toast(t("Keep every stage nonempty and the plan below 12,000 characters.")); return;
   }
+  const executionSelection = plan.executionSelection ?? composerExecutionSelection(sessionId);
+  if (!executionSelection) return;
   plan.sending = true;
   if (draftKey() === key) paintTaskPlan();
   try {
     const result = await run(api.sendInput({ id: crypto.randomUUID(), sessionId, projectId,
-      text: stages[0]!, stages: stages.slice(1), mode: 'finish', dueAt: Date.now(), model: null, reasoningEffort: null }));
+      text: stages[0]!, stages: stages.slice(1), mode: 'finish', dueAt: Date.now(), model: null, reasoningEffort: null, ...executionSelection }));
     if (result) {
       // The result already retired its source prompt. Admission leaves any newer
       // composer draft and attachments alone; the durable queue owns the stages.
@@ -3291,6 +3296,8 @@ async function retryPlannedInput(entry: InputEntry): Promise<void> {
   // The outbox retains the authored workflow after failure. Retry that payload, not
   // its stage-one display text, and never revive the old browser claim/receipt.
   const { sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery, automation, loopAfterTurn, model, reasoningEffort, afterTurn } = entry;
+  const executionSelection = composerExecutionSelection(sessionId);
+  if (!executionSelection) return;
   const args: InputArgs = { id: crypto.randomUUID(), sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery,
     automation, loopAfterTurn, model, reasoningEffort, afterTurn, mode: entry.requestedMode ?? entry.mode, dueAt: Date.now() };
   const generation = selectionGeneration;
@@ -3307,7 +3314,7 @@ async function retryPlannedInput(entry: InputEntry): Promise<void> {
     startingInputs.set(args.id, { ...args, state: 'queued', owner: null, createdAt: args.dueAt, conversationId: null });
     if (sessionId === null) pendingNewInput = { id: args.id, generation };
     paintDeliveryControls(); void refreshInputQueue();
-    const result = await run(api.sendInput(args));
+    const result = await run(api.sendInput({ ...args, ...executionSelection }));
     if (cancelledStarts.has(args.id)) return;
     if (!result) return;
     accepted = true;
@@ -3364,6 +3371,8 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
     }
     return;
   }
+  const executionSelection = composerExecutionSelection(selectedId);
+  if (!executionSelection) return false;
   const discoveryGeneration = ++composerDiscoveryGeneration;
   const discoverySelection = selectionGeneration, discoverySession = selectedId, discoveryDraft = input.value;
   const modelSettings = confirmedComposerModel() ?? await ensureComposerModel();
@@ -3392,7 +3401,8 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
   void refreshInputQueue();
   paintDeliveryControls();
   try {
-    const result = await run(api.sendInput({ id, sessionId, projectId, text, ...attachmentPayload, stages: plan?.slice(1), objective, automation: mode === 'finish' ? undefined : $<HTMLSelectElement>('chatAutomation').value as InputAutomation, loopAfterTurn: openingLoopDelivery(), mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn', dueAt, ...modelSettings }));
+    const result = await run(api.sendInput({ id, sessionId, projectId, text, ...attachmentPayload, stages: plan?.slice(1), objective, automation: mode === 'finish' ? undefined : $<HTMLSelectElement>('chatAutomation').value as InputAutomation, loopAfterTurn: openingLoopDelivery(), mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn', dueAt, ...modelSettings,
+      ...executionSelection }));
     if (cancelledStarts.has(id)) return;
     if (!result) {
       if (selectedId === sessionId && selectionGeneration === generation && !input.value) input.value = authoredDraft;
@@ -3449,6 +3459,7 @@ function selectSession(id: string): void {
   newChatSelected = false;
   selectedId = id;
   const selected = sessions.find(row => row.id === id);
+  setComposerNodeContext(selected ? { id, executionTarget: selected.executionTarget } : { id });
   applyComposerSessionModel(`${id}:${selectionGeneration}`, selected?.selectedModel ?? null);
   const parent = selected?.origin?.kind === 'worker' ? selected.origin.fromSessionId : null;
   if (parent) expandedWorkers.add(parent);
@@ -3469,6 +3480,7 @@ function selectSession(id: string): void {
 function selectNewChat(projectId: string | null = null): void {
   rememberDraft(); selectionGeneration++; pendingNewInput = null;
   newChatSelected = true; selectedId = null; selectedProjectId = projectId; detailFor = null; detailCursor = null;
+  setComposerNodeContext(null);
   applyComposerSessionModel(null, null);
   cancelTaskPlan();
   inputDrafts.delete(draftKey()); imageDrafts.delete(draftKey());
@@ -3486,6 +3498,10 @@ export function initChat(next: Deps): void {
     .filter(entry => entry.conversationId && entry.origin?.kind !== 'worker')
     .map(entry => ({ id: entry.id, scope: projectGroup(entry.projectId) ?? '' })), paintSessions);
   deps = next;
+  initNodes((sessionId, target) => {
+    const summary = sessions.find(row => row.id === sessionId);
+    if (summary) summary.executionTarget = { ...target };
+  });
   const agentToggle = el('button', 'btn btn-icon', '◫') as HTMLButtonElement;
   agentToggle.id = 'agentPanelToggle'; agentToggle.type = 'button'; agentToggle.hidden = true;
   ui(agentToggle, 'aria-label', () => t("Toggle sub-agent side panel")); agentToggle.setAttribute('aria-expanded', 'false');
@@ -3575,6 +3591,8 @@ export function initChat(next: Deps): void {
       const id = selectedId;
       const objective = $<HTMLTextAreaElement>('sessionObjective');
       if (!id) {
+        const executionSelection = composerExecutionSelection(null);
+        if (!executionSelection) return;
         const draft = objective.value, mode = $<HTMLSelectElement>('sessionObjectiveMode').value as 'goal' | 'loop';
         if (!draft.trim()) return;
         const settings = confirmedComposerModel();
@@ -3601,7 +3619,7 @@ export function initChat(next: Deps): void {
           startingInputs.set(inputId, entry); pendingNewInput = { id: inputId, generation: selection };
           goalProgress = { requestId, selection, inputId, phase: 'queued', text: '' }; paintDeliveryControls();
           try {
-            const accepted = await run(api.sendInput(entry));
+            const accepted = await run(api.sendInput({ ...entry, ...executionSelection }));
             if (accepted) { inputQueueGeneration++; pendingComposerInputs = [...pendingComposerInputs.filter(row => row.id !== inputId), accepted];
               // Off may arrive while sendInput is still validating/enqueuing, before
               // the outbox row exists. Reconcile that same pending intent after acceptance.

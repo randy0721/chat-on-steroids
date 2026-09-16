@@ -54,13 +54,29 @@ export function toast(message: string): void {
   toastTimer = window.setTimeout(() => node.remove(), 3200);
 }
 
-/** Unwraps an IPC reply, showing the main process's own error text on failure. */
+/** 执行目标不可用时保留显式提示，避免瞬时 toast 被后续界面刷新覆盖。 */
+export function executionErrorDialog(message: string): void {
+  document.querySelector('#executionErrorDialog')?.remove();
+  const box = document.createElement('dialog');
+  box.id = 'executionErrorDialog'; box.className = 'plugin-dialog';
+  box.setAttribute('role', 'alertdialog'); box.setAttribute('aria-labelledby', 'executionErrorTitle');
+  const head = el('div', 'plugin-dialog-head');
+  const title = el('h2', '', () => t('Execution computer unavailable')); title.id = 'executionErrorTitle';
+  const close = el('button', 'btn', () => t('Close'));
+  close.addEventListener('click', () => box.close()); head.append(title, close);
+  const body = el('div', 'plugin-dialog-body');
+  body.append(el('p', '', () => t('Your message was not sent. Check the computer binding and connection, then try again.')), el('p', '', message));
+  box.append(head, body); box.addEventListener('close', () => box.remove());
+  document.body.append(box); box.showModal();
+}
+
 export async function run<T>(
   promise: Promise<{ ok: true; data: T } | { ok: false; error: string }>
 ): Promise<T | null> {
   const reply = await promise;
   if (!reply.ok) {
-    toast(reply.error);
+    if (/\b(?:TARGET_[A-Z_]+|NODE_[A-Z_]+|AUTH_FAILED):/.test(reply.error)) executionErrorDialog(reply.error);
+    else toast(reply.error);
     return null;
   }
   return reply.data;

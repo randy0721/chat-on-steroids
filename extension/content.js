@@ -3083,6 +3083,7 @@
       requests.push({
         requestId,
         messageId: cap(entry.messageId, 200) || null,
+        ...(cap(entry.userMessageId, 200) ? { userMessageId: cap(entry.userMessageId, 200) } : {}),
         createTime: typeof entry.createTime === 'number' && isFinite(entry.createTime) ? entry.createTime : null
       });
     }
@@ -3353,7 +3354,9 @@
     const byRequest = new Map();
     for (const call of calls) {
       if (!call || !call.requestId || byRequest.has(call.requestId)) continue;
-      if (requestOwnersConfirmed.get(call.requestId) === ownerConversation) continue;
+      const confirmed = requestOwnersConfirmed.get(call.requestId);
+      if (confirmed?.conversationId === ownerConversation &&
+          (!call.userMessageId || confirmed.userMessageId === call.userMessageId)) continue;
       const key = `${ownerConversation}\u0000${call.requestId}`;
       if (requestOwnersPending.has(key) || (requestOwnerRetryAt.get(key) || 0) > Date.now()) continue;
       byRequest.set(call.requestId, call);
@@ -3382,7 +3385,7 @@
         }
         requestOwnerRetryAt.delete(key);
         requestOwnerAttempts.delete(key);
-        requestOwnersConfirmed.set(call.requestId, ownerConversation);
+        requestOwnersConfirmed.set(call.requestId, { conversationId: ownerConversation, userMessageId: call.userMessageId || null });
         // `app` becomes green only after the app has read the exact mapping back. This is a
         // stronger diagnostic than the old "Fiber parser saw an id" indicator.
         traceStage(call.requestId, 'sent');
@@ -3394,6 +3397,7 @@
       for (const call of batch) requestOwnersPending.delete(`${ownerConversation}\u0000${call.requestId}`);
     }
   }
+
   async function refreshFiber(settled = null) {
     // A bound chat can briefly lose its /c/<id> route during React/router churn, and a real
     // navigation to a fresh composer has the exact same pathname until ChatGPT assigns the
@@ -3589,6 +3593,17 @@
     }
     const activeTurnIndex =
       ownedPageTurn && activeLocalTurnId ? answer.turns.indexOf(ownedPageTurn) : -1;
+    // 用户与助手可以分属不同页面 turn；只按 provider request_id 连接身份，不按相邻位置猜测。
+    const requestUsers = new Map();
+    for (const turn of answer.turns) {
+      if (turn !== ownedPageTurn && concreteConversation(turn.conversationId) !== askedConversation) continue;
+      for (const request of turn.requests || []) {
+        if (!request.userMessageId) continue;
+        const prior = requestUsers.get(request.requestId);
+        requestUsers.set(request.requestId, prior === undefined || prior === request.userMessageId ? request.userMessageId : null);
+      }
+    }
+    const withInputIdentity = call => requestUsers.get(call.requestId) ? { ...call, userMessageId: requestUsers.get(call.requestId) } : call;
     if (askedConversation) {
       // Ownership evidence is no longer gated on `activeTurnIndex`.
       //
@@ -3619,7 +3634,7 @@
           for (const call of turn[source] || []) {
             if (!call || !call.requestId || ownerSeen.has(call.requestId)) continue;
             ownerSeen.add(call.requestId);
-            ownerCalls.push(call);
+            ownerCalls.push(withInputIdentity(call));
           }
         }
       }
@@ -3666,10 +3681,10 @@
         // the already-proven owner remains authoritative and no sticky conflict is manufactured.
         if (
           provisionalOwnedTurn &&
-          (!call.requestId || requestOwnersConfirmed.get(call.requestId) !== askedConversation)
+          (!call.requestId || requestOwnersConfirmed.get(call.requestId)?.conversationId !== askedConversation)
         ) return false;
         const owner = index === activeTurnIndex ? activeLocalTurnId || '' : '';
-        const signature = `${call.tool}\u0000${call.requestId || ''}\u0000${call.answered ? '1' : '0'}\u0000${owner}`;
+        const signature = `${call.tool}\u0000${call.requestId || ''}\u0000${call.answered ? '1' : '0'}\u0000${owner}\u0000${requestUsers.get(call.requestId) || ''}`;
         if (callsReported.get(call.messageId) === signature) return false;
         callsReported.set(call.messageId, signature);
         return true;
@@ -3685,7 +3700,7 @@
             concreteConversation(turn.conversationId) &&
             concreteConversation(turn.conversationId) !== askedConversation
           ) ? { fiberConversationId: turn.conversationId } : {}),
-          calls: fresh
+          calls: fresh.map(withInputIdentity)
         });
       }
     }
@@ -3699,7 +3714,7 @@
       );
       const awaitingOwner = answer.turns.some((turn) =>
         (turn.calls || []).some((call) =>
-          call && call.requestId && (!askedConversation || requestOwnersConfirmed.get(call.requestId) !== askedConversation)
+          call && call.requestId && (!askedConversation || requestOwnersConfirmed.get(call.requestId)?.conversationId !== askedConversation)
         )
       );
       if (!awaitingRequestId && !awaitingOwner) fiberSettleUntil = 0;
@@ -9982,7 +9997,8 @@
     // the loop below because ChatGPT has not assigned their new conversation id yet.
     if (target) {
       publishBootstrapSelection(target);
-      const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: target, agent, client: RUN_ID });
+      const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: target, agent, client: RUN_ID,
+        ...(boot.type === 'resume' && acceptedBootstrap?.messageId ? { userMessageId: acceptedBootstrap.messageId } : {}) });
       await clearAcknowledgedBootstrap(acknowledged);
       return;
     }
@@ -9997,14 +10013,16 @@
       if (found) {
         if (boot.type === 'resume') rememberResumeGoalPending(found, boot.id);
         publishBootstrapSelection(found);
-        const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+        const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID,
+          ...(boot.type === 'resume' && acceptedBootstrap?.messageId ? { userMessageId: acceptedBootstrap.messageId } : {}) });
         await clearAcknowledgedBootstrap(acknowledged);
         return;
       }
     }
     // Sent, but this tab never saw an id, so nothing can be bound to it. Reported honestly:
     // the app ends the slot or the continuation rather than waiting on a chat it cannot name.
-    await ask({ type: 'ack', id: boot.id, status: 'sent', agent, client: RUN_ID });
+    await ask({ type: 'ack', id: boot.id, status: 'sent', agent, client: RUN_ID,
+      ...(boot.type === 'resume' && acceptedBootstrap?.messageId ? { userMessageId: acceptedBootstrap.messageId } : {}) });
     } finally { bootstrapDraft.dispose(); }
   }
 

@@ -15,12 +15,15 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { freezeLocalExecution } from '../src/main/nodes/router.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
-import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
+import { createSession, initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
 
 /** Bytes the probe command writes to stdout. Comfortably past both budgets under test. */
 const PROBE_BYTES = 200_000;
@@ -86,10 +89,10 @@ function sseJson(body: string): unknown {
 }
 
 /** The model-visible text of one `exec_command` call. */
-async function execOutput(url: string, maxOutputTokens: number | undefined): Promise<string> {
+async function execOutput(url: string, maxOutputTokens: number | undefined, requestId: string): Promise<string> {
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'x-request-id': requestId },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -115,9 +118,18 @@ async function execOutput(url: string, maxOutputTokens: number | undefined): Pro
 
 it('silently accepts the retired max_output_tokens while enforcing the same real output budget', async () => {
   endpoint = await serve();
+  const conversationId = randomUUID();
+  const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
+  const session = await createSession({ conversationId, title: 'Exec output budget fixture' });
+  const inputId = randomUUID();
+  const executionSnapshot = freezeLocalExecution(session.executionTarget!, session.id, inputId);
+  expect(observeRequestCorrelation({
+    requestId, conversationId, sessionId: session.id, inputId, executionSnapshot,
+    messageId: randomUUID(), tool: 'exec_command', observedAt: Date.now()
+  })).toBe('stored');
 
-  const requested = await execOutput(endpoint.url, 30_000);
-  const omitted = await execOutput(endpoint.url, undefined);
+  const requested = await execOutput(endpoint.url, 30_000, requestId);
+  const omitted = await execOutput(endpoint.url, undefined, requestId);
 
   // The command really ran and really overflowed the budget.
   expect(requested).toContain('Process exited with code 0');
