@@ -2846,18 +2846,27 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .remote-node-editor label { display: grid; gap: 5px; color: var(--soft); font-size: 11px; }
 .remote-node-editor input { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--edge); border-radius: var(--r-xs); background: var(--sunk); color: var(--ink); font: inherit; }
 .remote-node-editor-actions { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; }
-#nodeMenu > summary { max-width: 170px; }
-#nodeMenu > summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#nodeMenu .composer-popover { width: 330px; }
-#nodeMenu .composer-popover label { display: grid; align-items: stretch; gap: 6px; padding: 8px 9px; color: var(--soft); font-size: 11px; }
-#nodeMenu .composer-popover select, #nodeMenu .composer-popover input { width: 100%; max-width: none; min-width: 0; padding: 7px 8px; border: 1px solid var(--edge); border-radius: var(--r-xs); background: var(--sunk); color: var(--ink); font: inherit; }
-#composerNodeStatus { margin: 6px 9px 8px; }
-#nodeMenu .node-rebind { width: calc(100% - 18px); margin: 0 9px 8px; justify-content: center; }
+.composer-node-picker { display: inline-flex; align-items: center; gap: 5px; height: 36px; padding: 0 5px 0 7px; border-radius: 8px; color: var(--soft); flex: 0 0 auto; }
+.composer-node-picker:hover, .composer-node-picker:focus-within { color: var(--ink); background: var(--hover); }
+.composer-node-picker > .ico { width: 18px; height: 18px; flex: 0 0 18px; }
+#composerNode { width: calc(4em + 22px); max-width: calc(4em + 22px); min-width: 0; height: 30px; padding: 4px 18px 4px 0; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: clip; }
+#composerNode::picker-icon { margin-inline-start: 4px; margin-inline-end: 1px; }
+#composerNode::picker(select) { width: max-content; min-width: 96px; max-width: 220px; }
+#composerNode option { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.composer-node-details { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 2px 0; }
+.composer-node-details[hidden] { display: none; }
+.composer-node-details label { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; color: var(--soft); font-size: 11px; }
+.composer-node-details label > span { flex: 0 0 auto; white-space: nowrap; }
+.composer-node-details input { min-width: 0; flex: 1; padding: 6px 8px; border: 1px solid var(--edge); border-radius: var(--r-xs); background: var(--sunk); color: var(--ink); font: inherit; font-size: 12px; }
+#composerNodeStatus { margin: 0; min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.composer-node-details .node-rebind { flex: 0 0 auto; padding: 6px 9px; justify-content: center; }
 @media (max-width: 720px) {
   .remote-node-row { align-items: flex-start; flex-direction: column; }
   .remote-node-actions { justify-content: flex-start; }
   .remote-node-editor { grid-template-columns: minmax(0, 1fr); }
   .remote-node-editor-actions { grid-column: 1; }
+  .composer-node-details { flex-wrap: wrap; }
+  #composerNodeStatus { flex-basis: 100%; order: 3; }
 }
 .composer-popover .muted { margin: 6px 9px; font-size: 11px; line-height: 1.5; }
 

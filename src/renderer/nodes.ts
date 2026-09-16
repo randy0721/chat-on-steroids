@@ -1,7 +1,7 @@
 import type { ExecutionTarget } from '../shared/nodes.js';
 import type { OpeningExecutionSelection, RendererNodeView } from '../shared/types.js';
 import { $, el, run, toast, executionErrorDialog } from './dom.js';
-import { t, ui } from './i18n.js';
+import { t } from './i18n.js';
 
 const LOCAL_NODE_ID = 'local';
 
@@ -165,16 +165,8 @@ function paintRebindAction(): void {
   button.disabled = !node || !remoteReady || button.dataset.busy === 'true';
 }
 
-function currentBindingStatus(): string {
-  if (!currentBinding) return t('This session has no durable execution binding yet.');
-  const node = nodeById(currentBinding.nodeId);
-  const name = currentBinding.nodeId === LOCAL_NODE_ID ? t('This computer') : node?.name ?? currentBinding.nodeId;
-  const workspace = currentBinding.workspace ? ` · ${currentBinding.workspace}` : '';
-  return t('Current binding · {0} · version {1}{2}', [name, currentBinding.bindingVersion, workspace]);
-}
-
 function paintComposerSelector(): void {
-  const menu = $<HTMLDetailsElement>('nodeMenu');
+  const menu = $('nodeMenu');
   menu.hidden = false;
   const select = $<HTMLSelectElement>('composerNode');
   const prior = composerNodeId;
@@ -198,19 +190,22 @@ function paintComposerSelector(): void {
   }
   select.value = composerNodeId;
   const node = nodeById(composerNodeId);
-  ui($('composerNodeLabel'), 'textContent', () => node?.transport === 'remote-stdio-ws' ? node.name : t('This computer'));
+  const selectedName = node?.transport === 'remote-stdio-ws' ? node.name : t('This computer');
+  select.title = selectedName;
 
+  const details = $('composerNodeDetails');
   const workspaceRow = $('composerWorkspaceRow');
   const workspaceInput = $<HTMLInputElement>('composerWorkspace');
   const roots = $<HTMLDataListElement>('composerWorkspaceRoots');
   const remote = node?.transport === 'remote-stdio-ws' ? node : null;
+  details.hidden = !remote && (composerIsNewChat || selectionMatchesBinding());
   workspaceRow.hidden = !remote;
   roots.replaceChildren(...(remote?.runtimeInfo?.approvedRoots ?? []).map(root => {
     const option = document.createElement('option'); option.value = root; return option;
   }));
   workspaceInput.value = remote ? composerWorkspace : '';
   workspaceInput.disabled = !remote || remote.status !== 'connected';
-  if (!composerIsNewChat && selectionMatchesBinding()) setWorkspaceStatus(currentBindingStatus());
+  if (!composerIsNewChat && selectionMatchesBinding()) setWorkspaceStatus('');
   else if (!remote) setWorkspaceStatus(composerIsNewChat ? t('New chats currently open on this computer.') : t('Switch this chat to this computer.'));
   else if (remote.status !== 'connected') setWorkspaceStatus(t('Connect this node in Settings before choosing a workspace.'));
   else if (validatedWorkspace?.nodeId === remote.id && validatedWorkspace.workspace === composerWorkspace) {

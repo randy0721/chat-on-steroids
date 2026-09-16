@@ -896,16 +896,10 @@
               </div>
                     </div>
                   </details>
-                  <details class="composer-menu node-menu" id="nodeMenu">
-                    <summary aria-label="Execution computer" title="Execution computer"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-monitor" /></svg><span id="composerNodeLabel">This computer</span></summary>
-                    <div class="composer-popover">
-                      <label>Computer<select id="composerNode" aria-label="Execution computer"></select></label>
-                      <label id="composerWorkspaceRow" hidden>Remote workspace<input id="composerWorkspace" type="text" maxlength="32768" spellcheck="false" list="composerWorkspaceRoots" placeholder="Choose an approved remote path" /></label>
-                      <datalist id="composerWorkspaceRoots"></datalist>
-                      <p id="composerNodeStatus" class="muted" role="status"></p>
-                      <button class="btn node-rebind" id="composerNodeRebind" type="button" hidden>Switch this chat</button>
-                    </div>
-                  </details>
+                  <div class="composer-node-picker" id="nodeMenu" title="Execution computer">
+                    <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-monitor" /></svg>
+                    <select id="composerNode" aria-label="Execution computer"></select>
+                  </div>
                 <div class="context-meter" id="contextMeter">
                   <button type="button" id="contextMeterButton" aria-label="Estimated session context" aria-expanded="false" aria-controls="contextMeterInfo">
                     <svg viewBox="0 0 16 16" aria-hidden="true"><circle class="context-track" cx="8" cy="8" r="6"/><circle id="contextMeterArc" cx="8" cy="8" r="6" stroke-dasharray="0 37.7"/></svg>
@@ -933,6 +927,12 @@
                   </div>
                   <button class="send-button" id="chatSend" type="submit" aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" /></svg></button>
                 </div>
+              </div>
+              <div class="composer-node-details" id="composerNodeDetails" hidden>
+                <label id="composerWorkspaceRow" hidden><span>Remote workspace</span><input id="composerWorkspace" type="text" maxlength="32768" spellcheck="false" list="composerWorkspaceRoots" placeholder="Choose an approved remote path" /></label>
+                <datalist id="composerWorkspaceRoots"></datalist>
+                <p id="composerNodeStatus" class="muted" role="status"></p>
+                <button class="btn node-rebind" id="composerNodeRebind" type="button" hidden>Switch this chat</button>
               </div>
               <p id="composerStatus" role="status" aria-live="polite"></p>
             </form>

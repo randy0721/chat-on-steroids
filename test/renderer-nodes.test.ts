@@ -15,13 +15,13 @@ function shell(): JSDOM {
     <button id="remoteNodesRefresh"></button><button id="remoteNodeAdd"></button><button id="remoteNodeCancel"></button>
     <div id="remoteNodesList"></div>
     <form id="remoteNodeEditor" hidden><input id="remoteNodeId"><input id="remoteNodeName"><input id="remoteNodeEndpoint"><input id="remoteNodeMachine"><input id="remoteNodeToken"></form>
-    <details id="nodeMenu"><summary><span id="composerNodeLabel"></span></summary><div>
-      <select id="composerNode"></select>
+    <div id="nodeMenu"><select id="composerNode"></select></div>
+    <div id="composerNodeDetails" hidden>
       <label id="composerWorkspaceRow"><input id="composerWorkspace"></label>
       <datalist id="composerWorkspaceRoots"></datalist>
       <p id="composerNodeStatus"></p>
       <button id="composerNodeRebind" type="button"></button>
-    </div></details>
+    </div>
   </body></html>`, { url: 'https://local.test/' });
 }
 
@@ -67,8 +67,8 @@ describe('renderer execution node selector', () => {
     const captured = nodes.composerExecutionSelection('session-abcd1234');
     expect(captured).toEqual({ expectedExecutionTarget: { nodeId: 'local', workspace: '/project', nodeConfigVersion: 1, bindingVersion: 3 } });
     expect(document.getElementById('nodeMenu')!.hidden).toBe(false);
-    expect(document.getElementById('composerNodeLabel')!.textContent).toBe('This computer');
-    expect(document.getElementById('composerNodeStatus')!.textContent).toContain('version 3');
+    expect((document.getElementById('composerNode') as HTMLSelectElement).title).toBe('This computer');
+    expect(document.getElementById('composerNodeDetails')!.hidden).toBe(true);
     expect((document.getElementById('composerNodeRebind') as HTMLButtonElement).hidden).toBe(true);
 
     const select = document.getElementById('composerNode') as HTMLSelectElement;
@@ -83,7 +83,7 @@ describe('renderer execution node selector', () => {
     expect(rebind).toHaveBeenNthCalledWith(1, 'session-abcd1234', 'office', 'D:\\work');
     expect(rebound).toHaveBeenCalledWith('session-abcd1234', expect.objectContaining({ nodeId: 'office', bindingVersion: 4 }));
     expect(captured?.expectedExecutionTarget?.nodeId).toBe('local');
-    expect(document.getElementById('composerNodeStatus')!.textContent).toContain('version 4');
+    expect(document.getElementById('composerNodeStatus')!.textContent).toBe('');
 
     select.value = 'local';
     select.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
