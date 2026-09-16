@@ -12,8 +12,8 @@ it('uses reviewed transitional licenses only for the exact installed distributio
   expect(reviewedPluginLicense({ ...fetch.source, version: '2099.1.0' }, 'See installed dist-info licenses')).toBe('See installed dist-info licenses');
 });
 
-it('offers seven distinct reviewed recipes with packaged local artwork', async () => {
-  expect(pluginCatalog).toHaveLength(7);
+it('offers eight distinct reviewed recipes with packaged local artwork', async () => {
+  expect(pluginCatalog).toHaveLength(8);
   expect(new Set(pluginCatalog.map(recipe => recipe.id)).size).toBe(pluginCatalog.length);
   for (const recipe of pluginCatalog) {
     if (recipe.source.kind === 'remote') {
@@ -27,14 +27,30 @@ it('offers seven distinct reviewed recipes with packaged local artwork', async (
 
 it('keeps the curated catalog focused on capabilities beyond Core file and exec tools', () => {
   expect(pluginCatalog.map(recipe => recipe.id)).toEqual([
-    'blender', 'memory', 'playwright', 'fetch', 'heygen', 'recraft', 'unity',
+    'blender', 'memory', 'mysql', 'playwright', 'fetch', 'heygen', 'recraft', 'unity',
   ]);
   for (const recipe of pluginCatalog) {
     expect(recipe.tools?.length).toBeGreaterThan(0);
     expect(new Set(recipe.tools).size).toBe(recipe.tools?.length);
-    for (const field of recipe.fields) expect(field.secret).toBe(true);
+    for (const field of recipe.fields) {
+      if (/password|token|secret|api.?key/i.test(field.key)) expect(field.secret).toBe(true);
+    }
     expect(recipe.source.args?.join(' ') ?? '').not.toMatch(/api.?key|token/i);
   }
+});
+
+it('keeps the MySQL preset read-only by default and separates connection settings from the password', () => {
+  const mysql = pluginCatalog.find(recipe => recipe.id === 'mysql')!;
+  expect(mysql.source).toEqual({ kind: 'npm', package: 'mysql-mcp-server', version: '0.1.3' });
+  expect(mysql.tools).toEqual(['list_databases', 'list_tables', 'describe_table', 'execute_query']);
+  expect(mysql.fields.map(field => [field.key, !!field.secret, !!field.required])).toEqual([
+    ['MYSQL_HOST', false, true],
+    ['MYSQL_PORT', false, false],
+    ['MYSQL_DATABASE', false, false],
+    ['MYSQL_USER', false, true],
+    ['MYSQL_PASSWORD', true, false],
+  ]);
+  expect(mysql.instructions.join(' ')).toContain('read-only');
 });
 
 it('preserves an exact license reference for every pinned catalog distribution', async () => {

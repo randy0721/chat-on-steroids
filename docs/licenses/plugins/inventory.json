@@ -19,6 +19,24 @@
     "repository": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory"
   },
   {
+    "id": "mysql",
+    "package": "mysql-mcp-server",
+    "version": "0.1.3",
+    "license": "MIT",
+    "archive": "https://registry.npmjs.org/mysql-mcp-server/-/mysql-mcp-server-0.1.3.tgz",
+    "integrity": "sha512-6gCcKi5U3tvzI7Uiqvzx2uSbTwGkEeMSGACfZ2OXb/9zVBBTWKDxBeTvkuzV8CaojbWBH7R+KU94t9oJ9Kon/Q==",
+    "notices": [
+      {
+        "file": "mysql-LICENSE",
+        "upstreamArchivePath": "package/LICENSE",
+        "sha256": "3bed3331b7048bac17cf50e249d560ccc9508c970da8d7b9283bf4f2e633a91d"
+      }
+    ],
+    "checkedOn": "2026-09-16",
+    "bundledWithApp": false,
+    "repository": "https://github.com/dpflucas/mysql-mcp-server"
+  },
+  {
     "id": "playwright",
     "package": "@playwright/mcp",
     "version": "0.0.80",

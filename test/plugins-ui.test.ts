@@ -146,6 +146,44 @@ it('opens a concise tool preview without installing or showing enabled-tool cont
   expect(api.pluginsInstall).not.toHaveBeenCalled();
 });
 
+it('reuses the catalog setup UI for MySQL and keeps its password in secure credentials', async () => {
+  state.plugins = [];
+  state.catalog = [{
+    id: 'mysql', icon: 'mysql', color: '#4f8fb8', name: 'MySQL Database',
+    description: 'Read-only MySQL and MariaDB access for schema inspection and SQL queries.',
+    source: { kind: 'npm', package: 'mysql-mcp-server', version: '0.1.3' },
+    homepage: 'https://github.com/dpflucas/mysql-mcp-server', license: 'MIT',
+    instructions: ['Install Node.js 18+.'], tools: ['list_databases', 'list_tables', 'describe_table', 'execute_query'],
+    fields: [
+      { key: 'MYSQL_HOST', label: 'MySQL host', required: true },
+      { key: 'MYSQL_PORT', label: 'MySQL port', placeholder: '3306' },
+      { key: 'MYSQL_DATABASE', label: 'Default database', placeholder: 'Optional' },
+      { key: 'MYSQL_USER', label: 'MySQL user', required: true },
+      { key: 'MYSQL_PASSWORD', label: 'MySQL password', secret: true },
+    ],
+  }];
+  await refreshPlugins();
+  document.querySelector<HTMLButtonElement>('#pluginsExplore .plugin-catalog-card')!.click();
+  expect(document.getElementById('pluginDialogTitle')!.textContent).toBe('Set up MySQL Database');
+  expect([...document.querySelectorAll('.plugin-tool-preview li')].map(node => node.textContent)).toEqual([
+    'list_databases', 'list_tables', 'describe_table', 'execute_query',
+  ]);
+  const inputs = [...document.querySelectorAll<HTMLInputElement>('#pluginDialog .plugin-field input')];
+  expect(inputs).toHaveLength(5);
+  expect(inputs.map(input => input.type)).toEqual(['text', 'text', 'text', 'text', 'password']);
+  inputs[0]!.value = '127.0.0.1';
+  inputs[3]!.value = 'readonly_user';
+  inputs[4]!.value = 'private-password';
+  [...document.querySelectorAll<HTMLButtonElement>('#pluginDialog button')].find(node => node.textContent === 'Install and connect')!.click();
+  await tick();
+  expect(api.pluginsInstall).toHaveBeenCalledWith({
+    catalogId: 'mysql',
+    config: { MYSQL_HOST: '127.0.0.1', MYSQL_USER: 'readonly_user' },
+    credentials: { MYSQL_PASSWORD: 'private-password' },
+  });
+  expect(document.body.textContent).not.toContain('private-password');
+});
+
 it('opens the full error from the compact card and exposes configuration beside the introduction', async () => {
   const error = 'Connection refused. Start the application and enable its companion integration.';
   state.plugins[0]!.error = error;

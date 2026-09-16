@@ -217,7 +217,7 @@ function showConfigure(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Configure {0}", [plugin.name])); const config = new Map<string, HTMLInputElement>(); const secrets = new Map<string, HTMLInputElement>();
   const name = field(body, () => t("Display name"), plugin.name);
   for (const item of plugin.fields ?? snapshot.catalog.find((entry) => entry.id === plugin.catalogId)?.fields ?? [])
-    (item.secret ? secrets : config).set(item.key, field(body, item.label, item.secret ? '' : plugin.config[item.key] ?? '', item.secret, () => item.secret ? t("Leave empty to keep the saved credential.") : item.placeholder ?? ''));
+    (item.secret ? secrets : config).set(item.key, field(body, () => t(item.label), item.secret ? '' : plugin.config[item.key] ?? '', item.secret, () => item.secret ? t("Leave empty to keep the saved credential.") : item.placeholder ? t(item.placeholder) : ''));
   for (const [key, value] of Object.entries(plugin.config)) if (!config.has(key)) config.set(key, field(body, key, value));
   for (const key of plugin.credentialKeys) if (!secrets.has(key)) secrets.set(key, field(body, key, '', true, () => t("Leave empty to keep the saved credential.")));
   const source = field(body, () => t("Server configuration (JSON)"), JSON.stringify(plugin.source), false, () => t("Keep credentials in the secure fields, not in command arguments or URLs."));
@@ -251,15 +251,18 @@ function showRecipe(recipe: PluginCatalogEntry): void {
   const setup = document.createElement('details'); setup.className = 'plugin-about'; setup.append(el('summary', '', () => t("Setup requirements")));
   const steps = el('ol', 'plugin-steps'); for (const step of recipe.instructions) steps.append(el('li', '', () => t(step))); setup.append(steps, button(() => t("Open project & setup guide"), async () => { await run(window.api.openLink(recipe.homepage)); })); body.append(setup);
   const values = new Map<string, HTMLInputElement>();
-  for (const item of recipe.fields) { const input = field(body, item.label, '', item.secret, item.placeholder); input.required = !!item.required; values.set(item.key, input); }
+  for (const item of recipe.fields) { const input = field(body, () => t(item.label), '', item.secret, () => item.placeholder ? t(item.placeholder) : ''); input.required = !!item.required; values.set(item.key, input); }
   const remote = recipe.source.kind === 'remote';
   body.append(el('p', 'hint', () => remote
     ? t("{0}. Connect your account through the provider. Its plan and usage limits apply.", [recipe.license])
     : t("License: {0}. Installation downloads and runs third-party code as your OS user. “Ready” requires a successful connection and tool discovery.", [recipe.license])));
   actions.append(button(() => remote ? t("Add connection") : t("Install and connect"), async () => {
-    for (const item of recipe.fields) if (item.required && !values.get(item.key)!.value.trim()) { values.get(item.key)!.focus(); throw new Error(t("{0} is required.", [item.label])); }
+    for (const item of recipe.fields) if (item.required && !values.get(item.key)!.value.trim()) { values.get(item.key)!.focus(); throw new Error(t("{0} is required.", [t(item.label)])); }
     const config: Record<string,string> = {}; const credentials: Record<string,string> = {};
-    for (const item of recipe.fields) (item.secret ? credentials : config)[item.key] = values.get(item.key)!.value;
+    for (const item of recipe.fields) {
+      const value = values.get(item.key)!.value.trim();
+      if (value || item.required) (item.secret ? credentials : config)[item.key] = value;
+    }
     if (await mutate(window.api.pluginsInstall({ catalogId: recipe.id, config, credentials }))) {
       box.close();
       if (remote) { const installed = snapshot.plugins.find(plugin => plugin.catalogId === recipe.id); if (installed) showPlugin(installed); }
