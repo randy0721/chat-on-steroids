@@ -2404,10 +2404,17 @@ describe('through the MCP endpoint', () => {
 
   it('waits for late input proof before freezing a worker invitation', async () => {
     const { observeRequestCorrelation, enrichRequestCorrelationsForInput } = await import('../src/main/session/correlation.js');
+    const { enqueueInput, claimBrowserInput } = await import('../src/main/session/input.js');
     const { inFlightMcpRequests } = await import('../src/main/mcp/call-context.js');
     const conversationId = 'c-late-spawn-proof';
     const requestId = 'wfr_late_spawn_proof';
-    const executionSnapshot = await exactExecutionFor(conversationId);
+    const session = await createSession({ conversationId, executionTarget: TEST_EXECUTION_TARGET });
+    const authored = await enqueueInput({
+      id: randomUUID(), sessionId: session.id, text: 'spawn a worker after this reaches ChatGPT', mode: 'auto',
+      dueAt: Date.now(), model: null, reasoningEffort: null
+    });
+    expect(await claimBrowserInput(authored.id, 'late-proof-page', conversationId)).toBeTruthy();
+    const executionSnapshot = authored.executionSnapshot!;
     observeRequestCorrelation({ requestId, conversationId, sessionId: executionSnapshot.sessionId,
       userMessageId: 'late-spawn-user', messageId: 'late-spawn-call', tool: 'agents', observedAt: Date.now() });
     const pending = agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'use the frozen input target' }] });
@@ -2416,6 +2423,28 @@ describe('through the MCP endpoint', () => {
     expect(enrichRequestCorrelationsForInput({ conversationId, userMessageId: 'late-spawn-user', inputId: executionSnapshot.inputId, executionSnapshot })).toBe(1);
     expect(await pending).not.toContain('TARGET_CONTEXT_UNRESOLVED');
     expect(pendingWorkerSpawns()[0]?.executionTarget).toEqual({ nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 });
+  });
+
+  it('defaults a browser-native worker spawn with exact chat identity to Local', async () => {
+    const { observeRequestCorrelation } = await import('../src/main/session/correlation.js');
+    const conversationId = 'c-browser-native-spawn';
+    const session = await createSession({ conversationId });
+    const requestId = 'wfr_browser_native_spawn';
+    observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: session.id,
+      userMessageId: 'browser-native-spawn-user',
+      messageId: 'browser-native-spawn-call',
+      tool: 'agents',
+      observedAt: Date.now()
+    });
+
+    const text = await agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'use the local default' }] });
+    expect(text).not.toContain('TARGET_CONTEXT_UNRESOLVED');
+    expect(pendingWorkerSpawns()[0]?.executionTarget).toEqual({
+      nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1
+    });
   });
 
   it('is identified by exact request-id evidence that arrived before the call it names', async () => {

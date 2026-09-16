@@ -352,13 +352,18 @@ export function observeRequestCorrelations(
  */
 export async function awaitRequestExecution(
   requestId: string | null | undefined,
-  timeoutMs: number
+  timeoutMs: number,
+  shouldWaitForSnapshot?: (owner: RequestCorrelation) => boolean | Promise<boolean>
 ): Promise<RequestCorrelation | null> {
   if (!requestId) return null;
   const deadline = performance.now() + Math.max(0, timeoutMs);
   for (;;) {
     const held = requestCorrelation(requestId);
     if (held?.executionSnapshot) return held;
+    // A browser-native user message can prove its exact conversation/session without ever having
+    // an app outbox row to contribute executionSnapshot. Let the caller distinguish that case
+    // from an app-authored browser send whose ACK may still strengthen this same owner.
+    if (held && shouldWaitForSnapshot && !await shouldWaitForSnapshot(held)) return held;
     const remaining = deadline - performance.now();
     if (remaining <= 0) return held;
     let timer: NodeJS.Timeout | null = null;

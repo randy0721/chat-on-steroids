@@ -438,13 +438,16 @@ native conversation id as the route/server identity materializes. A `WEB:` local
 historical Fiber object, conflicting durable ids, active tab, timing, tool name, arrival order
 or “only generating chat” is never a replacement proof.
 
-Computer tools and worker spawn additionally require the durable input's frozen execution
-snapshot. `fiber.js` reports a user message's own `metadata.request_id` independently of text;
-`content.js` joins user/assistant descriptors by that id, never by neighboring turn order.
-Conversation-only acknowledgement cannot suppress a later exact user-message anchor.
-`bridge.ts` retains the late anchor even before Send ACK, and that exact ACK enriches waiting
-requests. Kernel admission waits for this proof for direct, nested and worker-spawn calls.
-Missing proof always fails closed; UI/session selection never repairs a missing request snapshot.
+Computer tools and worker spawn use the durable input's frozen execution snapshot whenever the
+message came through the app outbox. `fiber.js` reports a user message's own
+`metadata.request_id` independently of text; `content.js` joins user/assistant descriptors by
+that id, never by neighboring turn order. Conversation-only acknowledgement cannot suppress a
+later exact user-message anchor. `bridge.ts` retains the late anchor even before Send ACK, and
+that exact ACK enriches waiting requests. Kernel admission waits for this proof while an
+app-authored browser send is still awaiting its receipt. A user message authored directly in the
+ChatGPT browser has no outbox snapshot; once its exact conversation/session is proved, missing
+execution selection defaults to the built-in Local target. An explicitly remote-bound session
+still requires its exact frozen snapshot and never falls back to Local.
 
 `correlation.ts` keeps the first exact request owner and its **local session epoch**. Conflicting
 claims do not overwrite it. Proof has no time TTL but the index is bounded to 50,000 recently
@@ -470,7 +473,9 @@ including Core's structured supplemental context. Current blocked, compacting, s
 inactive-worker restrictions veto delivery; the notice never grants permission or repeats work.
 
 `allowUnattributedCalls` permits ordinary tools and code mode without chat attribution,
-including external plugin tools. Computer operations still require the frozen input proof above.
+including external plugin tools. Computer operations still require an exact conversation/session;
+app-authored sends use their frozen input proof, while browser-native sends use the Local default
+described above.
 Windows observations use a separate shared unattributed context so follow-up input works.
 Plan updates, agent operations, finish signals, chat-specific workspace selection and owned
 terminal access still require their actual owner; the setting cannot invent that identity.

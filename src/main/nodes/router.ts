@@ -145,10 +145,11 @@ function changed(detail: string): ExecutionRouterError {
 /**
  * Admission fence for the stable model-facing computer tools.
  *
- * Exact request -> input snapshot resolution happens in the kernel before any top-level
- * computer handler is admitted. This function therefore never reconstructs authority from the
- * session's current target: missing frozen authority is an error even when that current target
- * happens to be local. Nested code-mode calls arrive with the parent's already-frozen snapshot.
+ * Exact request -> input snapshot resolution happens in the kernel before app-authored computer
+ * work is admitted. Browser-native turns have no outbox snapshot by design; once their exact
+ * conversation/session is known, a missing target defaults to Local when the durable session is
+ * still Local. Explicit Remote sessions never use that fallback. Nested code-mode calls inherit
+ * the parent's resolved snapshot.
  */
 export async function executionAdmission(
   context: CallContext,
@@ -156,22 +157,53 @@ export async function executionAdmission(
   name: string,
   args?: unknown
 ): Promise<ExecutionRouterError | null> {
-  if (!routesComputerTool(surface, name) && !spawnsWorker(surface, name, args)) return null;
+  const routedComputerCall = routesComputerTool(surface, name) || spawnsWorker(surface, name, args);
+  const codeMode = (surface === 'core' || surface === 'desktop') && name === 'exec';
+  if (!routedComputerCall && !codeMode) return null;
 
-  const execution = context.execution;
+  let execution = context.execution;
   const sessionId = context.caller.sessionId;
-  if (!execution || !sessionId || !context.caller.conversationId) {
+  // `exec` is a composition shell, not itself a computer side effect. Preserve the existing
+  // unattributed-code-mode contract: an anonymous outer exec may run, while any computer child
+  // it tries still comes back through this admission fence and is refused without an owner.
+  if (codeMode && (!sessionId || !context.caller.conversationId)) return null;
+  if (!sessionId || !context.caller.conversationId) {
     return new ExecutionRouterError(
       'TARGET_CONTEXT_UNRESOLVED',
-      'this call has no exact frozen input target; no local fallback was attempted'
+      'this call has no exact conversation/session owner, so its execution computer cannot be selected'
     );
   }
+  const session = await getSession(sessionId);
+  const target = session?.executionTarget;
+  if (!session) return changed('the proven execution session is unavailable');
+
+  // Browser-native chats do not pass through the desktop outbox, so they legitimately have no
+  // input.executionSnapshot to correlate. Their durable session target defaults to Local; when
+  // that is still the target, synthesize a call-scoped Local snapshot here. An explicitly remote
+  // session never takes this fallback: remote work still requires the exact frozen input proof.
+  if (!execution) {
+    if (target && target.nodeId !== LOCAL_NODE_ID) {
+      return new ExecutionRouterError(
+        'TARGET_CONTEXT_UNRESOLVED',
+        `this browser-originated call has no frozen target, and session ${sessionId} is explicitly bound to remote node ${target.nodeId}`
+      );
+    }
+    try {
+      execution = freezeLocalExecution(target ?? localExecutionTarget(), sessionId, randomUUID());
+      context.execution = execution;
+    } catch (error) {
+      return error instanceof ExecutionRouterError ? error : registryFailure(error, 'TARGET_CONTEXT_UNRESOLVED');
+    }
+  }
+
   if (sessionId !== execution.sessionId) {
     return changed('the proven session does not own this frozen execution snapshot');
   }
-  const session = await getSession(execution.sessionId);
-  const target = session?.executionTarget;
-  if (!session || !target) return changed('the frozen execution session or target is unavailable');
+  if (!target) {
+    // Legacy browser-created sessions may predate durable executionTarget. Missing selection now
+    // means Local by product policy; exact snapshots still require their persisted target below.
+    return execution.nodeId === LOCAL_NODE_ID ? null : changed('the frozen execution session target is unavailable');
+  }
   if (target.nodeId !== execution.nodeId || target.workspace !== execution.workspace ||
       target.bindingVersion !== execution.bindingVersion || target.nodeConfigVersion !== execution.nodeConfigVersion) {
     return changed('the session target changed after this input was frozen');

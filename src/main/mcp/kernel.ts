@@ -1,4 +1,4 @@
-import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { offerToolInput, acknowledgeToolInput, browserExecutionProofPending, TOOL_INPUT_HEADER } from '../session/input.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -571,7 +571,11 @@ async function dispatchTracked(
   // machine owns the call, so computer tools never use the old unattributed/local shortcut.
   if (!nested) setCallerConversation(context, callerConversation(name, startedAt, requestId));
   if (!nested && requestId && requiresExecutionContext(surface, name, args) && !context.execution) {
-    const exactExecution = await awaitRequestExecution(requestId, REQUEST_ID_GRACE_MS);
+    const exactExecution = await awaitRequestExecution(
+      requestId,
+      REQUEST_ID_GRACE_MS,
+      (owner) => browserExecutionProofPending(owner.sessionId)
+    );
     if (exactExecution) setCallerConversation(context, exactExecution.conversationId);
   }
   // Only calls that need an *existing* per-chat workspace before the handler runs are

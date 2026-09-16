@@ -189,6 +189,25 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
     return false;
   });
 }
+
+/**
+ * Whether this session currently has a desktop-authored browser send whose exact provider
+ * receipt may still strengthen request correlation with its frozen execution snapshot.
+ *
+ * Browser-native user messages have no outbox row at all. The kernel uses this distinction to
+ * avoid waiting the full execution-proof grace window before applying the product's Local
+ * default, while still preserving exact snapshot delivery for messages authored by the app.
+ */
+export function browserExecutionProofPending(sessionId: string): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    return current.some((row) =>
+      (row.sessionId === sessionId || row.deliveredSessionId === sessionId) &&
+      !!row.executionSnapshot &&
+      (row.state === 'browser' || (row.state === 'cancelled' && row.deliveredAt === undefined))
+    );
+  });
+}
 let entries: InputEntry[] | null = null;
 let chain: Promise<unknown> = Promise.resolve();
 // A timestamp written before the claim commit cannot prove that its response was

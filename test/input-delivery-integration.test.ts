@@ -1439,6 +1439,36 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await input.listInputs()).find(row => row.id === authored.id)?.executionSnapshot).toEqual(frozen);
   });
 
+  it('defaults an exactly attributed browser-native turn to Local without waiting for an outbox snapshot', async () => {
+    const { observeRequestCorrelation } = await import('../src/main/session/correlation.js');
+    const { dispatch, ok } = await import('../src/main/mcp/kernel.js');
+    const { currentCall } = await import('../src/main/mcp/call-context.js');
+    const conversationId = randomUUID();
+    const session = await createSession({ conversationId });
+    const requestId = `wfr_${randomUUID()}`;
+    observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: session.id,
+      userMessageId: 'browser-native-user',
+      messageId: 'browser-native-call',
+      tool: 'read',
+      observedAt: Date.now()
+    });
+
+    const ran = vi.fn(async () => {
+      expect(currentCall()?.caller).toMatchObject({ conversationId, sessionId: session.id });
+      expect(currentCall()?.execution).toMatchObject({ nodeId: 'local', sessionId: session.id });
+      expect(currentCall()?.execution?.inputId).toMatch(/^[0-9a-f-]{36}$/i);
+      return ok('browser native local fallback');
+    });
+    const startedAt = Date.now();
+    const result = await dispatch('read', {}, null, requestId, 'core', ran);
+    expect(result.isError).not.toBe(true);
+    expect(ran).toHaveBeenCalledOnce();
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('blocks an observed old extension protocol before desktop send and accepts a refreshed peer', async () => {
     const hello = async (protocol: number) => fetch(`http://127.0.0.1:${bridgePort()}/hello`, {
       headers: { 'x-extension-version': APP_VERSION, 'x-extension-protocol': String(protocol) }

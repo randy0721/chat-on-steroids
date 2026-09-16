@@ -72,8 +72,20 @@ describe('session-bound execution foundation', () => {
       execution
     };
     expect(await executionAdmission(context, 'core', 'read')).toBeNull();
-    expect((await executionAdmission({ ...context, execution: null }, 'core', 'read'))?.code)
-      .toBe('TARGET_CONTEXT_UNRESOLVED');
+    const browserNative: CallContext = { ...context, execution: null };
+    expect(await executionAdmission(browserNative, 'core', 'read')).toBeNull();
+    expect(browserNative.execution).toMatchObject({
+      nodeId: LOCAL_NODE_ID,
+      sessionId: session.id,
+      workspace: null,
+      bindingVersion: 1,
+      nodeConfigVersion: LOCAL_NODE_CONFIG_VERSION
+    });
+    expect(browserNative.execution?.inputId).toMatch(/^[0-9a-f-]{36}$/i);
+
+    const browserCodeMode: CallContext = { ...context, execution: null };
+    expect(await executionAdmission(browserCodeMode, 'core', 'exec')).toBeNull();
+    expect(browserCodeMode.execution?.nodeId).toBe(LOCAL_NODE_ID);
     expect((await executionAdmission({ ...context, caller: { ...context.caller, conversationId: null, sessionId: null }, execution: null }, 'core', 'exec_command'))?.code)
       .toBe('TARGET_CONTEXT_UNRESOLVED');
 
