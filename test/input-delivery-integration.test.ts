@@ -1406,37 +1406,72 @@ describe('IPC input delivery and Goal control integration', () => {
     await input.offerToolInput(session.id, conversationId, 'overlapping-request', 0);
     expect(goal.goalSwitchFor(conversationId).enabled).toBe(false);
   });
-  it('joins a late exact user anchor and ACK to the frozen UI input before admitting computer tools', async () => {
+  it('uses the selected Local project immediately when its provider ACK is late, then strengthens later calls with the exact frozen input', async () => {
     const { requestCorrelation } = await import('../src/main/session/correlation.js');
     const { dispatch, ok } = await import('../src/main/mcp/kernel.js');
     const { currentCall } = await import('../src/main/mcp/call-context.js');
-    const conversationId = randomUUID();
-    const session = await createSession({ conversationId });
-    const authored = message(session.id, 'off');
-    const sent = await handlers.get('sessions:send')!(null, authored);
-    expect(sent).toMatchObject({ ok: true });
-    const frozen = sent.data.executionSnapshot;
-    expect(frozen).toMatchObject({ inputId: authored.id, sessionId: session.id, nodeId: 'local' });
-    expect((await post('/input/claim', { id: authored.id, owner: 'proof-page', conversationId })).body.input).toBeTruthy();
-    const requestId = `wfr_${randomUUID()}`;
-    const evidence = { requestId, messageId: 'assistant-proof', tool: 'read', order: 0, answered: false };
-    await post('/correlations', { conversationId, calls: [evidence] });
-    expect(requestCorrelation(requestId)?.executionSnapshot).toBeUndefined();
-    const ran = vi.fn(async () => {
-      expect(currentCall()?.execution).toEqual(frozen);
-      return ok('exact frozen target');
-    });
-    const pending = dispatch('read', {}, null, requestId, 'core', ran);
-    await post('/correlations', { conversationId, calls: [{ ...evidence, userMessageId: 'provider-proof-user' }] });
-    expect(requestCorrelation(requestId)?.userMessageId).toBe('provider-proof-user');
-    expect(ran).not.toHaveBeenCalled();
-    await post('/input/ack', { id: authored.id, owner: 'proof-page', conversationId, messageId: 'provider-proof-user' });
-    expect((await pending).isError).not.toBe(true);
-    expect(ran).toHaveBeenCalledOnce();
-    expect(requestCorrelation(requestId)?.executionSnapshot).toEqual(frozen);
-    expect((await dispatch('exec_command', {}, null, requestId, 'core', ran)).isError).not.toBe(true);
-    expect((await dispatch('get_window_state', {}, null, requestId, 'desktop', ran)).isError).not.toBe(true);
-    expect((await input.listInputs()).find(row => row.id === authored.id)?.executionSnapshot).toEqual(frozen);
+    const folder = path.join(directory, `late-local-ack-${randomUUID()}`);
+    await fs.mkdir(folder);
+    const base = defaultConfig();
+    await saveConfig({ ...base, roots: [{ name: 'selected-project', path: folder }] });
+    try {
+      const project = await addProject(folder);
+      const authored = { ...message(null, 'off'), projectId: project.id, text: 'Build the selected project' };
+      const sent = await handlers.get('sessions:send')!(null, authored);
+      expect(sent).toMatchObject({ ok: true });
+      const frozen = sent.data.executionSnapshot;
+      const sessionId = sent.data.sessionId as string;
+      expect(frozen).toMatchObject({
+        inputId: authored.id, sessionId, nodeId: 'local', workspace: '/selected-project'
+      });
+
+      const owner = 'late-local-ack-page';
+      expect((await post('/input/claim', { id: authored.id, owner, conversationId: null })).body.input).toBeTruthy();
+      const conversationId = randomUUID();
+      expect((await post('/input/bind', { id: authored.id, owner, conversationId })).body.ok).toBe(true);
+
+      // The browser has observed the provider user anchor and the tool request, but its final
+      // /input/ack was lost. This is the production incident: the durable desktop input already
+      // froze Local + project workspace, while request correlation knows only chat/session.
+      const requestId = `wfr_${randomUUID()}`;
+      const evidence = {
+        requestId, messageId: 'late-local-ack-call', tool: 'read', order: 0, answered: false,
+        userMessageId: 'late-local-ack-user'
+      };
+      await post('/correlations', { conversationId, calls: [evidence] });
+      expect(requestCorrelation(requestId)).toMatchObject({ conversationId, sessionId, userMessageId: 'late-local-ack-user' });
+      expect(requestCorrelation(requestId)?.executionSnapshot).toBeUndefined();
+
+      const fallbackRan = vi.fn(async () => {
+        expect(currentCall()?.execution).toMatchObject({
+          nodeId: frozen.nodeId,
+          workspace: frozen.workspace,
+          bindingVersion: frozen.bindingVersion,
+          nodeConfigVersion: frozen.nodeConfigVersion,
+          sessionId
+        });
+        return ok('local project fallback');
+      });
+      const startedAt = Date.now();
+      expect((await dispatch('read', {}, null, requestId, 'core', fallbackRan)).isError).not.toBe(true);
+      expect(fallbackRan).toHaveBeenCalledOnce();
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+
+      // A genuinely late native Send receipt still strengthens this same request to the exact
+      // original input snapshot, so later calls retain the stronger proof when it becomes known.
+      expect((await post('/input/ack', {
+        id: authored.id, owner, conversationId, messageId: 'late-local-ack-user'
+      })).body.ok).toBe(true);
+      expect(requestCorrelation(requestId)?.executionSnapshot).toEqual(frozen);
+      const exactRan = vi.fn(async () => {
+        expect(currentCall()?.execution).toEqual(frozen);
+        return ok('exact frozen target');
+      });
+      expect((await dispatch('exec_command', {}, null, requestId, 'core', exactRan)).isError).not.toBe(true);
+      expect(exactRan).toHaveBeenCalledOnce();
+    } finally {
+      await saveConfig(base);
+    }
   });
 
   it('defaults an exactly attributed browser-native turn to Local without waiting for an outbox snapshot', async () => {

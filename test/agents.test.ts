@@ -2402,10 +2402,9 @@ describe('through the MCP endpoint', () => {
     expect(Object.keys(schema.properties)).not.toContain('agent');
   });
 
-  it('waits for late input proof before freezing a worker invitation', async () => {
-    const { observeRequestCorrelation, enrichRequestCorrelationsForInput } = await import('../src/main/session/correlation.js');
+  it('uses the durable Local binding for a worker invitation before late input proof strengthens the request', async () => {
+    const { observeRequestCorrelation, enrichRequestCorrelationsForInput, requestCorrelation } = await import('../src/main/session/correlation.js');
     const { enqueueInput, claimBrowserInput } = await import('../src/main/session/input.js');
-    const { inFlightMcpRequests } = await import('../src/main/mcp/call-context.js');
     const conversationId = 'c-late-spawn-proof';
     const requestId = 'wfr_late_spawn_proof';
     const session = await createSession({ conversationId, executionTarget: TEST_EXECUTION_TARGET });
@@ -2417,12 +2416,15 @@ describe('through the MCP endpoint', () => {
     const executionSnapshot = authored.executionSnapshot!;
     observeRequestCorrelation({ requestId, conversationId, sessionId: executionSnapshot.sessionId,
       userMessageId: 'late-spawn-user', messageId: 'late-spawn-call', tool: 'agents', observedAt: Date.now() });
-    const pending = agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'use the frozen input target' }] });
-    await vi.waitFor(() => expect(inFlightMcpRequests()).toBeGreaterThan(0));
-    expect(pendingWorkerSpawns()).toEqual([]);
-    expect(enrichRequestCorrelationsForInput({ conversationId, userMessageId: 'late-spawn-user', inputId: executionSnapshot.inputId, executionSnapshot })).toBe(1);
-    expect(await pending).not.toContain('TARGET_CONTEXT_UNRESOLVED');
+    const reply = await agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'use the frozen input target' }] });
+    expect(reply).not.toContain('TARGET_CONTEXT_UNRESOLVED');
+    expect(requestCorrelation(requestId)?.executionSnapshot).toBeUndefined();
     expect(pendingWorkerSpawns()[0]?.executionTarget).toEqual({ nodeId: 'local', workspace: null, bindingVersion: 1, nodeConfigVersion: 1 });
+
+    // The late provider receipt still upgrades future calls to the original desktop input
+    // snapshot; Local fallback only removes the unnecessary wait while that receipt is absent.
+    expect(enrichRequestCorrelationsForInput({ conversationId, userMessageId: 'late-spawn-user', inputId: executionSnapshot.inputId, executionSnapshot })).toBe(1);
+    expect(requestCorrelation(requestId)?.executionSnapshot).toEqual(executionSnapshot);
   });
 
   it('defaults a browser-native worker spawn with exact chat identity to Local', async () => {

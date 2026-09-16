@@ -5,7 +5,7 @@ import { REASONING_EFFORTS, workSequence } from '../../shared/session.js';
  */
 import { z } from 'zod';
 import { browserInputModel, type InputImage } from '../../shared/input.js';
-import { executionSnapshotSchema } from '../../shared/nodes.js';
+import { executionSnapshotSchema, LOCAL_NODE_ID } from '../../shared/nodes.js';
 import type { SessionSummary } from '../../shared/session.js';
 import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
@@ -200,6 +200,13 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
  */
 export function browserExecutionProofPending(sessionId: string): Promise<boolean> {
   return serial(async () => {
+    const session = await getSession(sessionId);
+    // Local execution has a deliberate product fallback: once the exact conversation/session
+    // owner is known, a missing provider receipt must not make every computer call sit through
+    // the full proof grace window. The durable session binding still supplies the selected
+    // workspace and binding epoch to executionAdmission(). Remote targets keep waiting for the
+    // exact frozen input snapshot because there is no safe remote fallback.
+    if (!session?.executionTarget || session.executionTarget.nodeId === LOCAL_NODE_ID) return false;
     const current = await load();
     return current.some((row) =>
       (row.sessionId === sessionId || row.deliveredSessionId === sessionId) &&
