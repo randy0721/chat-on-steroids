@@ -2197,8 +2197,12 @@ it('loads bounded earlier pages on deliberate upward scrolling without draining 
   await up(); expect(timeline.textContent).toContain('History item 41');
   await up(); expect(timeline.textContent).toContain('History item 1');
   expect(timeline.querySelectorAll('[data-timeline-key]').length).toBeLessThanOrEqual(160);
-  (timeline.querySelector('[data-history="latest"]') as HTMLElement).click(); await settle();
+  const latestJump = w.document.getElementById('timelineLatestJump') as HTMLButtonElement;
+  expect(latestJump.hidden).toBe(false);
+  expect(timeline.querySelector('.timeline-window-note')).toBeNull();
+  latestJump.click(); await settle();
   expect(timeline.textContent).toContain('Newest live input');
+  expect(latestJump.hidden).toBe(true);
 });
 it('scrolls forward through evicted history with wheel, keyboard and scrollbar, then resumes live deltas', async () => {
   const rows = Array.from({ length: 400 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,

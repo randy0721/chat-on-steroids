@@ -2221,14 +2221,10 @@ function paintDetail(followBottom = historyBefore === null): void {
   const pane = $('chatBody');
   const restoreViewport = preserveTimelineViewport(pane, $('timeline'), followBottom);
   const timelineRows: HTMLElement[] = [];
-  if (selectedId && historyBefore !== null) {
-    const navigation = el('div', 'timeline-window-note');
-    const latest = el('button', 'btn small', () => t("Back to latest"));
-    latest.dataset.history = 'latest';
-    latest.addEventListener('click', () => void navigateHistory(null));
-    navigation.append(latest);
-    timelineRows.push(navigation);
-  }
+  const latestJump = $<HTMLButtonElement>('timelineLatestJump');
+  latestJump.hidden = !(selectedId && historyBefore !== null);
+  latestJump.title = t("Back to latest");
+  latestJump.setAttribute('aria-label', t("Back to latest"));
   const keep = new Set<string>();
   let activityBoundary = '';
   paintRecoveryStatus();
@@ -3753,6 +3749,7 @@ export function initChat(next: Deps): void {
   // One bounded window pages in either direction, only on deliberate navigation.
   // Layout restoration must never drain history or jump straight to the live tail.
   const historyPane = $('chatBody');
+  $('timelineLatestJump').addEventListener('click', () => void navigateHistory(null));
   let historyIntent: string | null = null;
   let historyDirection = 0;
   const loadAtEdge = () => {
